@@ -1,3 +1,4 @@
+import { parseGenerationLlmContext, type GenerationLlmContext } from "../core/llm-context.js";
 /**
  * TDAI Memory Gateway — v2 REST Router.
  *
@@ -20,12 +21,13 @@ import { classifyError } from "./error-handler.js";
 import type { IMemoryStore, L0Record, ProfileSyncRecord } from "../core/store/types.js";
 import type { EmbeddingService } from "../core/store/embedding.js";
 import { createScopedStorageAdapter, scopeProfileStorageView, type StorageAdapter } from "../core/storage/adapter.js";
-import { StoragePaths } from "../core/storage/types.js";
+import { StoragePaths, type IStorageBackend, type ListEntry } from "../core/storage/types.js";
 import type { Logger } from "../core/types.js";
 import type { IStateBackend } from "../core/state/types.js";
 import type { PipelineWorker } from "../services/pipeline-worker.js";
 import { executeMemorySearch } from "../core/tools/memory-search.js";
 import { executeConversationSearch } from "../core/tools/conversation-search.js";
+import { indexScenarioMemory, scenarioMemoryId } from "./scenario-memory-index.js";
 import type { MemoryRecord } from "../core/record/l1-writer.js";
 import { reportRecallMetrics } from "../core/report/metric-tracking-recall.js";
 
@@ -257,7 +259,7 @@ export interface V2RouterDeps {
    *   - standalone: LocalStateBackend (single-process, default)
    * When absent (misconfiguration), v2 add writes L0 only — pipeline is not triggered.
    */
-  notifyPipeline?: (instanceId: string, sessionId: string, messageCount: number, teamId?: string, agentId?: string) => Promise<void>;
+  notifyPipeline?: (instanceId: string, sessionId: string, messageCount: number, teamId?: string, agentId?: string, llmContext?: GenerationLlmContext) => Promise<void>;
 
   /** Quota manager for memory/credit limit checks and usage reporting (service mode). */
   quotaManager?: import("../core/quota/quota-manager.js").QuotaManager;
@@ -665,6 +667,9 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
   const parsed = conversationAddRequestSchema.safeParse(body);
   if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
   const { session_id, messages } = parsed.data;
+  let llmContext: Readonly<GenerationLlmContext> | undefined;
+  try { llmContext = parseGenerationLlmContext(parsed.data.llm_context); }
+  catch (err) { return errorEnvelope(422, err instanceof Error ? err.message : "Invalid generation context", requestId); }
 
   // Enforce three-dim isolation. user_id / agent_id come from request body
   // or x-tdai-* headers (resolved in dispatchV2Request).  When the gateway's
@@ -765,7 +770,7 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
     const rounds = messages.filter((m) => m.role === "user").length;
     if (rounds > 0) {
       try {
-        await deps.notifyPipeline(auth.serviceId, session_id, rounds, iso?.teamId, iso?.agentId);
+        await deps.notifyPipeline(auth.serviceId, session_id, rounds, iso?.teamId, iso?.agentId, llmContext);
       } catch (err) {
         // Non-fatal: L0 is already persisted, pipeline will catch up later
         deps.logger.warn(`${TAG} Pipeline notify failed for ${session_id}: ${err instanceof Error ? err.message : String(err)}`);
@@ -815,8 +820,8 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
     deps.quotaManager.reportMemoryAdded(auth.serviceId, acceptedIds.length).catch(() => {});
   }
 
-  return successEnvelope<ConversationAddData>(
-    { accepted_ids: acceptedIds, accepted_versions: acceptedIds.map(() => "v1"), total_count: acceptedIds.length },
+  return successEnvelope<ConversationAddData & { generation_model?: string }>(
+    { generation_model: llmContext?.model, accepted_ids: acceptedIds, accepted_versions: acceptedIds.map(() => "v1"), total_count: acceptedIds.length },
     requestId,
   );
 }
@@ -1278,6 +1283,7 @@ async function handleAtomicSearch(body: unknown, auth: V2AuthContext, requestId:
 
   const items: AtomicSearchHit[] = result.results.map((r) => ({
     id: r.id, type: r.type, content: r.content,
+    source_path: r.source_path,
     background: r.scene_name || undefined,
     version: r.version ?? 0,
     team_id: r.team_id,
@@ -1773,6 +1779,18 @@ async function refreshSceneIndex(storage: StorageAdapter, logger: Logger): Promi
 // L2 Scenario Handlers
 // ============================
 
+async function listAllScenarioObjects(backend: IStorageBackend, prefix: string): Promise<ListEntry[]> {
+  const entries: ListEntry[] = [];
+  let marker: string | undefined;
+  do {
+    const page = await backend.listObjects(prefix, { recursive: true, maxKeys: 1000, marker });
+    entries.push(...page.entries);
+    if (!page.nextMarker || page.nextMarker === marker) break;
+    marker = page.nextMarker;
+  } while (marker);
+  return entries;
+}
+
 async function handleScenarioLs(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
   const parsed = scenarioListRequestSchema.safeParse(body);
   if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
@@ -1788,11 +1806,9 @@ async function handleScenarioLs(body: unknown, _auth: V2AuthContext, requestId: 
 
   deps.logger.debug?.(`${TAG} [scenario/ls] storage.type=${storage.type}, prefix="${prefix}"`);
 
-  // One-shot full listing (no pagination; marker-based pagination planned for phase 2)
   const backend = storage.getBackend();
-  const result = await backend.listObjects(prefix, { recursive: true });
-  deps.logger.debug?.(`${TAG} [scenario/ls] listObjects returned ${result.entries.length} entries`);
-  const allEntries = result.entries;
+  const allEntries = await listAllScenarioObjects(backend, prefix);
+  deps.logger.debug?.(`${TAG} [scenario/ls] listObjects returned ${allEntries.length} entries`);
 
   // Read scene_index.json for summary + created/updated lookup
   const { readSceneIndex } = await import("../core/scene/scene-index.js");
@@ -1851,8 +1867,8 @@ async function handleScenarioCount(body: unknown, _auth: V2AuthContext, requestI
   const prefix = path_prefix
     ? `${StoragePaths.sceneBlocksDir}${path_prefix}`
     : StoragePaths.sceneBlocksDir;
-  const result = await storage.getBackend().listObjects(prefix, { recursive: true });
-  const total = result.entries.filter((e) => !e.isDirectory).length;
+  const entries = await listAllScenarioObjects(storage.getBackend(), prefix);
+  const total = entries.filter((entry) => !entry.isDirectory).length;
   return successEnvelope<CountData>({ total }, requestId);
 }
 
@@ -1924,7 +1940,8 @@ async function handleScenarioRead(body: unknown, _auth: V2AuthContext, requestId
 async function handleScenarioWrite(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
   const parsed = scenarioWriteRequestSchema.safeParse(body);
   if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
-  const { path, content, summary } = parsed.data;
+  const { path, content, summary, index_content, index_type } = parsed.data;
+  if (index_content && !deps.getStore()) return errorEnvelope(503, "Memory index is unavailable", requestId);
 
   const baseStorage = deps.getStorage();
   if (!baseStorage) return errorEnvelope(503, "Storage not available", requestId);
@@ -1932,15 +1949,15 @@ async function handleScenarioWrite(body: unknown, _auth: V2AuthContext, requestI
 
   const key = `${StoragePaths.sceneBlocksDir}${path}`;
 
-  // Existence check: path must already exist (no upsert/create)
+  // Scenario writes are upserts: new paths are created, while existing paths
+  // keep their original created timestamp and advance their profile version.
   const existing = await storage.readFile(key);
-  if (existing === null) return errorEnvelope(404, `Scenario file not found: ${path}`, requestId);
 
   // Parse existing META to preserve created + update updated/summary
   const now = new Date().toISOString();
   let finalContent: string;
 
-  const metaMatch = existing.match(/^-----META-START-----\n([\s\S]*?)\n-----META-END-----\n?/);
+  const metaMatch = existing?.match(/^-----META-START-----\n([\s\S]*?)\n-----META-END-----\n?/) ?? null;
   if (metaMatch) {
     // Parse existing META fields
     const metaBlock = metaMatch[1];
@@ -1973,6 +1990,19 @@ async function handleScenarioWrite(body: unknown, _auth: V2AuthContext, requestI
   const version = await syncProfileToVdb(store, "l2", path, finalContent, deps.logger, undefined, deps.requestIsolation);
   await refreshSceneIndex(storage, deps.logger);
 
+  let memoryId: string | undefined;
+  if (index_content && store) {
+    try {
+      memoryId = await indexScenarioMemory({
+        store, embedding: deps.getEmbedding(), isolation: deps.requestIsolation,
+        path, content: index_content, type: index_type,
+      });
+    } catch (error) {
+      deps.logger.warn(`${TAG} scenario index failed: ${error instanceof Error ? error.message : String(error)}`);
+      return errorEnvelope(503, "Document saved, but its memory index failed. Retry the same path to finish saving.", requestId);
+    }
+  }
+
   // 审计：L2 update — record_id 用 path（L2 主键 = 文件路径）
   await recordAudit(store, {
     record_id: path,
@@ -1986,6 +2016,7 @@ async function handleScenarioWrite(body: unknown, _auth: V2AuthContext, requestI
 
   return successEnvelope<ScenarioWriteData>({
     path,
+    memory_id: memoryId,
     updated_at: now,
     version,
     team_id: deps.requestIsolation?.teamId,
@@ -2019,6 +2050,9 @@ async function handleScenarioRm(body: unknown, _auth: V2AuthContext, requestId: 
   // Delete L2 profiles from VDB (best-effort)
   const store = deps.getStore();
   await deleteProfilesFromVdb(store, "l2", removedFilenames, deps.logger, deps.requestIsolation);
+  for (const filename of removedFilenames) {
+    await store?.deleteL1(scenarioMemoryId(filename, deps.requestIsolation), deps.requestIsolation);
+  }
   await refreshSceneIndex(storage, deps.logger);
 
   // 审计：L2 delete — 每个被删的 path 一行

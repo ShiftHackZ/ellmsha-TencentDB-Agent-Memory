@@ -338,7 +338,7 @@ ensure_knowledge_service_key() {
     fi
     KNOWLEDGE_SERVICE_KEY="ks-svc-${rand}"
     set_env_value KNOWLEDGE_SERVICE_KEY "$KNOWLEDGE_SERVICE_KEY" "$ENV_FILE"
-    info "已生成 KNOWLEDGE_SERVICE_KEY 并写回 $ENV_FILE（Panel 与 Knowledge 共用）"
+    info "已生成 KNOWLEDGE_SERVICE_KEY 并写回 ${ENV_FILE}（Panel 与 Knowledge 共用）"
   fi
 }
 

@@ -1,3 +1,4 @@
+import { parseGenerationLlmContext, type GenerationLlmContext } from "../core/llm-context.js";
 /**
  * StatefulPipelineManager — 基于 IStateBackend 的 Pipeline 调度器
  *
@@ -179,6 +180,7 @@ export class StatefulPipelineManager {
     rounds?: number,
     teamId?: string,
     agentId?: string,
+    llmContext?: GenerationLlmContext,
   ): Promise<void> {
     if (this.destroyed) return;
     if (this.sessionFilter.shouldSkip(sessionKey)) return;
@@ -187,10 +189,13 @@ export class StatefulPipelineManager {
     if (effectiveInstanceId === "__unset__") {
       throw new Error(`[pipeline-v2] notifyConversation called without explicit instanceId (session=${sessionKey}, got="${effectiveInstanceId}"). In service mode, instanceId must be provided.`);
     }
+    const origin = parseGenerationLlmContext(llmContext);
     const effectiveRounds = rounds ?? 1;
     this._activeInstances.add(effectiveInstanceId);
     const now = Date.now();
     const state = await this.stateBackend.getSessionState(effectiveInstanceId, sessionKey, teamId, agentId);
+    // Timers aggregate pending messages for this session. Queue jobs receive their own frozen snapshot.
+    await this.stateBackend.updateSessionState(effectiveInstanceId, sessionKey, { llm_context: origin }, teamId, agentId);
     const warmupThreshold = this.getEffectiveThreshold(state?.warmup_threshold ?? (this.enableWarmup ? 1 : 0));
 
     const taskPayload: TaskPayload = {
@@ -201,7 +206,7 @@ export class StatefulPipelineManager {
       teamId,
       agentId,
       priority: 0,
-      data: { instanceId: effectiveInstanceId, teamId, agentId, ...serializeTraceContext() },
+      data: { instanceId: effectiveInstanceId, teamId, agentId, llm_context: origin, ...serializeTraceContext() },
       createdAt: now,
     };
 
@@ -270,7 +275,7 @@ export class StatefulPipelineManager {
       teamId,
       agentId,
       priority: 0,
-      data: { instanceId: effectiveInstanceId, teamId, agentId },
+      data: { instanceId: effectiveInstanceId, teamId, agentId, llm_context: state.llm_context },
       createdAt: Date.now(),
     });
 
@@ -360,7 +365,7 @@ export class StatefulPipelineManager {
    * task with `triggeredBy: "drain"` — drain enqueues should pass the same
    * dedup checks as threshold-triggered tasks.
    */
-  async enqueueL1Drain(sessionKey: string, instanceId?: string, teamId?: string, agentId?: string): Promise<void> {
+  async enqueueL1Drain(sessionKey: string, instanceId?: string, teamId?: string, agentId?: string, llmContext?: GenerationLlmContext): Promise<void> {
     if (this.destroyed) return;
     const effectiveId = instanceId ?? this.defaultInstanceId;
     if (effectiveId === "__unset__") {
@@ -376,7 +381,7 @@ export class StatefulPipelineManager {
       teamId,
       agentId,
       priority: 0,
-      data: { instanceId: effectiveId, teamId, agentId, ...serializeTraceContext() },
+      data: { instanceId: effectiveId, teamId, agentId, llm_context: llmContext, ...serializeTraceContext() },
       createdAt: now,
     });
     this.logger?.debug?.(

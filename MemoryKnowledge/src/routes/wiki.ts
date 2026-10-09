@@ -17,6 +17,7 @@
  */
 
 import { Hono } from "hono";
+import { parseGenerationLlmContext } from "../llm-context.js";
 
 import type { WikiService } from "../store/index.js";
 import type { WikiSourceManager } from "../engines/wiki/index.js";
@@ -84,13 +85,19 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
       return c.json(wrapError(400, "wiki has no source files, upload before ingest"), 400);
     }
 
-    const result = wikiService.ingest(serviceId, row.team_id, wikiId, requesterUserId);
+    let result;
+    try {
+      const context = parseGenerationLlmContext(body.llm_context);
+      result = wikiService.ingest(serviceId, row.team_id, wikiId, requesterUserId, context);
+    } catch (err) {
+      return c.json(wrapError(422, err instanceof Error ? err.message : "Invalid generation context"), 422);
+    }
     if (result.kind === "not_found") return c.json(wrapError(404, "wiki not found"), 404);
     if (result.kind === "busy") {
       // 并发拒绝：干净最小的 409 响应体（调用方用 code 判断，不 parse message）。
       return c.json({ code: 409, message: "busy", data: { status: result.status, step: result.step } }, 409);
     }
-    return c.json(wrapOk({ wiki_id: result.row.wiki_id, status: result.row.status }), 202);
+    return c.json(wrapOk({ wiki_id: result.row.wiki_id, status: result.row.status, generation_model: result.generation_model }), 202);
   });
 
   app.post("/delete", async (c) => {

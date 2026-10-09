@@ -22,6 +22,8 @@
 
 /** 复用现有 checkpoint.ts 中的 PipelineSessionState 字段 */
 export interface PipelineSessionState {
+  /** Origin model for the next timer-triggered extraction; omitted from durable checkpoints. */
+  llm_context?: import("../llm-context.js").GenerationLlmContext;
   conversation_count: number;
   last_extraction_time: string;
   last_extraction_updated_time: string;

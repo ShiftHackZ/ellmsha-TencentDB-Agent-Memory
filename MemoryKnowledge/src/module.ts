@@ -24,6 +24,7 @@ import { createWikiSourceManager, type WikiSourceManager } from "./engines/wiki/
 import { indexProject, openIndex, syncIndex, getStats, closeIndex, type CodeGraphInstance } from "./engines/code/index.js";
 import { SourceFetcherRegistry } from "./source-fetcher/index.js";
 import { createLogger } from "./logger.js";
+import { parseGenerationLlmContext } from "./llm-context.js";
 import type { LlmConfig } from "./config.js";
 import { getGlobalLlmConcurrency } from "./config.js";
 import { buildProgressFn } from "./callback.js";
@@ -122,7 +123,8 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
     // Resolve protocol-specific fetcher (validates url: https-only + SSRF blocklist).
     const fetcher = fetcherRegistry.resolve(repoUrl);
 
-    const isExistingRepo = existsSync(join(dir, ".git"));
+    const isExistingRepo = existsSync(join(dir, ".git")) ||
+      (fetcher.supportedType === "local" && existsSync(join(dir, ".tdai-local-snapshot.json")));
     let didIncrementalSync = false;
     let version: string | null = null;
 
@@ -176,7 +178,7 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
     setInternalStatus("ingesting");
 
     // Per-instance LLM routing (proxy/byo/global fallback), keyed by service_id.
-    const effectiveLlm = resolveLlm(serviceId);
+    const effectiveLlm = ctx.llmConfig ?? resolveLlm(serviceId);
     // 进度只推 Panel（Panel 内存 store + wiki/get 聚合）；KS 不落进度态
     const onProgress = config.tmcCallbackUrl
       ? buildProgressFn(config.tmcCallbackUrl, wikiId, serviceId, teamId, ingestRunId)
@@ -215,6 +217,13 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
     queue: sharedQueue,
     logger: { info: log.info.bind(log), warn: log.warn.bind(log), error: log.error.bind(log) },
     callbackConfig,
+    resolveJobLlm: (serviceId, context) => {
+      const origin = parseGenerationLlmContext(context);
+      return origin ? {
+        ...llmConfig, mode: "custom", protocol: "openai", provider: "custom", stream: false,
+        baseUrl: origin.base_url, apiKey: origin.callback_token, model: origin.model,
+      } : { ...resolveLlm(serviceId) };
+    },
   });
   const cgService = new CodeGraphService({
     store,

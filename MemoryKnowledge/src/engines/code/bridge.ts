@@ -39,7 +39,8 @@ export function resolveToolsPath(): string {
 }
 
 async function loadModules() {
-  if (_codegraphModule) {
+  // Concurrent repository builds may arrive between the two awaited imports.
+  if (_codegraphModule && _toolsModule) {
     return extractExports();
   }
 

@@ -110,6 +110,8 @@ import {
 export const conversationAddRequestSchema = z.object({
   session_id: z.string().min(1).default(DEFAULT_ISOLATION_ID),
   messages: z.array(_conversationItemSchema).min(1).max(100),
+  /** Scoped callback capability for the originating agent model; never a provider key. */
+  llm_context: z.object({ base_url: z.string(), model: z.string(), callback_token: z.string() }).strict().optional(),
 });
 export type ConversationAddRequest = z.infer<typeof conversationAddRequestSchema>;
 
@@ -161,7 +163,11 @@ export interface AtomicQueryData {
   total: number;
 }
 
-export type AtomicSearchHit = AtomicDetail & { score: number };
+export type AtomicSearchHit = AtomicDetail & {
+  score: number;
+  /** Relative scenario path for reading the full source, when known. */
+  source_path?: string;
+};
 
 export interface AtomicSearchData {
   items: AtomicSearchHit[];
@@ -189,6 +195,8 @@ export interface ScenarioWriteData extends Omit<GeneratedScenarioWriteData, "ver
   version?: number;
   team_id?: string;
   agent_id?: string;
+  /** Stable L1 record ID when index_content was written successfully. */
+  memory_id?: string;
 }
 
 export interface CoreFile extends Omit<GeneratedCoreFile, "version"> {
@@ -270,6 +278,10 @@ export const scenarioWriteRequestSchema = z.object({
   path: safePath,
   content: z.string(),
   summary: z.string().optional(),
+  /** Optional verified knowledge or artifact excerpt, synchronously indexed for cross-session recall. */
+  index_content: z.string().min(1).max(8192).optional(),
+  /** Category of the indexed excerpt; defaults to episodic (evidence, not a global instruction). */
+  index_type: z.enum(["persona", "episodic", "instruction"]).optional(),
 });
 export type ScenarioWriteRequest = z.infer<typeof scenarioWriteRequestSchema>;
 

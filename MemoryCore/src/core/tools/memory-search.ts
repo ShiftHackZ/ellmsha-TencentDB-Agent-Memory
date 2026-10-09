@@ -33,6 +33,8 @@ export interface MemorySearchResultItem {
   version: number;
   created_at: string;
   updated_at: string;
+  /** Exact L2 scenario path, when the record was indexed from a document. */
+  source_path?: string;
 }
 
 export interface MemorySearchResult {
@@ -46,6 +48,14 @@ export interface MemorySearchResult {
 const TAG = "[memory-tdai][tdai_memory_search]";
 
 function toSearchItem(r: L1SearchResult): MemorySearchResultItem {
+  let sourcePath: string | undefined;
+  try {
+    const metadata = JSON.parse(r.metadata_json || "{}");
+    if (typeof metadata.source_path === "string") sourcePath = metadata.source_path;
+    else if (metadata.migration?.source === "ellmsha-v2-vault" && typeof metadata.migration.source_path === "string") {
+      sourcePath = `v2/${metadata.migration.source_path}`;
+    }
+  } catch { /* Legacy records may have no structured provenance. */ }
   return {
     id: r.record_id,
     content: r.content,
@@ -60,6 +70,7 @@ function toSearchItem(r: L1SearchResult): MemorySearchResultItem {
     version: r.version ?? 0,
     created_at: r.timestamp_start,
     updated_at: r.timestamp_end,
+    source_path: sourcePath,
   };
 }
 

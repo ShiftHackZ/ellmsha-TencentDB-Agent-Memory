@@ -25,6 +25,7 @@ const TAG = "[memory-tdai] [persona]";
 export class PersonaGenerator {
   private dataDir: string;
   private runner: LLMRunner;
+  private throwOnLlmError: boolean;
   private logger: Logger | undefined;
   private backupCount: number;
   private promptMode: MemoryPromptMode;
@@ -51,12 +52,15 @@ export class PersonaGenerator {
      * Must be configured with `enableTools: true`.
      */
     llmRunner?: LLMRunner;
+    /** Rethrow origin-model failures so the pipeline can retry without advancing state. */
+    throwOnLlmError?: boolean;
     /** StorageAdapter for file operations (COS/local). Falls back to fs when absent. */
     storage?: StorageAdapter;
     /** langfuse 上报身份四元组（team/user/agent/session），填充 trace 顶级字段。 */
     traceContext?: TraceContext;
   }) {
     this.dataDir = opts.dataDir;
+    this.throwOnLlmError = opts.throwOnLlmError ?? false;
     this.logger = opts.logger;
     this.promptMode = opts.promptMode ?? "chat";
     this.memoryPrompt = opts.memoryPrompt;
@@ -216,6 +220,7 @@ export class PersonaGenerator {
     } catch (err) {
       const elapsedMs = Date.now() - startMs;
       this.logger?.error(`${TAG} Persona generation failed after ${elapsedMs}ms: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+      if (this.throwOnLlmError) throw err;
       return false;
     }
 

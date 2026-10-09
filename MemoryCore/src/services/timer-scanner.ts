@@ -155,6 +155,7 @@ export class TimerScanner {
         for (const entry of expired) {
           const { instanceId, sessionId, taskType, priority, timerType, teamId, agentId } = this.parseShardMember(entry.member);
 
+          const state = await this.backend.getSessionState(instanceId, sessionId, teamId, agentId);
           const task: TaskPayload = {
             id: `${taskType}-${instanceId.slice(-8)}-${sessionId.slice(-8)}-${now}`,
             type: taskType,
@@ -164,7 +165,7 @@ export class TimerScanner {
             agentId,
             priority,
             createdAt: now,
-            data: { triggeredBy: "timer_scanner", timerMember: `${sessionId}:${timerType}`, instanceId, teamId, agentId },
+            data: { triggeredBy: "timer_scanner", timerMember: `${sessionId}:${timerType}`, instanceId, teamId, agentId, llm_context: state?.llm_context },
           };
 
           await this.backend.enqueueTask(task);

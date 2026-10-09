@@ -53,6 +53,17 @@ export const ZH_STOP_WORDS = new Set([
   "吗", "吧", "呢", "啊", "呀", "哦", "嗯",
 ]);
 
+// Version the persisted FTS tokens as well as the query tokenizer. Older jieba
+// indexes split Cyrillic words into individual letters and must be rebuilt.
+export const FTS_TOKENIZER_VERSION = 2;
+
+const QUERY_STOP_WORDS = new Set([
+  ...ZH_STOP_WORDS,
+  ..."a an the and or of to in on for with from is are was were be been it this that these those i me my we our you your he she they their what which who how do does did can could would should please".split(" "),
+  ..."а и или но в во на по из за к ко с со у о об от до для что это как какой какая какие который которая которые я мне меня мой моя мои мы наш вы ваш ты твой он она они его её их есть был была были быть бы же ли не да нет пожалуйста".split(" "),
+  ..."і та або але у від до для що це як який яка які я мені мій моя мої ми наш ви ваш він вона вони його її їх є був була були бути будь ласка".split(" "),
+]);
+
 /**
  * Build an FTS5 MATCH query from raw text.
  *
@@ -71,28 +82,7 @@ export const ZH_STOP_WORDS = new Set([
  *   "旅行计划 API" → '"旅行计划" OR "API"'
  */
 export function buildFtsQuery(raw: string): string | null {
-  const jieba = getJieba();
-
-  let tokens: string[];
-  if (jieba) {
-    tokens = jieba
-      .cutForSearch(raw, true)
-      .map((t) => t.trim())
-      .filter((t) => {
-        if (!t) return false;
-        if (!/[\p{L}\p{N}]/u.test(t)) return false;
-        if (ZH_STOP_WORDS.has(t)) return false;
-        return true;
-      });
-    tokens = [...new Set(tokens)];
-  } else {
-    tokens =
-      raw
-        .match(/[\p{L}\p{N}_]+/gu)
-        ?.map((t) => t.trim())
-        .filter(Boolean) ?? [];
-  }
-
+  const tokens = extractQueryTokens(raw);
   if (tokens.length === 0) return null;
   const quoted = tokens.map((t) => `"${t.replaceAll('"', "")}"`);
   return quoted.join(" OR ");
@@ -107,25 +97,8 @@ export function buildFtsQuery(raw: string): string | null {
  * Returns `[]` when nothing meaningful remains.
  */
 export function extractQueryTokens(raw: string): string[] {
-  const jieba = getJieba();
-  if (jieba) {
-    const tokens = jieba
-      .cutForSearch(raw, true)
-      .map((t) => t.trim())
-      .filter((t) => {
-        if (!t) return false;
-        if (!/[\p{L}\p{N}]/u.test(t)) return false;
-        if (ZH_STOP_WORDS.has(t)) return false;
-        return true;
-      });
-    return [...new Set(tokens)];
-  }
-  return (
-    raw
-      .match(/[\p{L}\p{N}_]+/gu)
-      ?.map((t) => t.trim())
-      .filter(Boolean) ?? []
-  );
+  const tokens = tokenizeForFts(raw).toLowerCase().match(/[\p{L}\p{M}\p{N}_]+/gu) ?? [];
+  return [...new Set(tokens.filter((token) => !QUERY_STOP_WORDS.has(token)))];
 }
 
 /**
@@ -145,8 +118,9 @@ export function extractQueryTokens(raw: string): string[] {
 export function tokenizeForFts(raw: string): string {
   const jieba = getJieba();
   if (!jieba) return raw;
-  const tokens = jieba.cutForSearch(raw, true);
-  return tokens.join(" ");
+  // Jieba's fallback for non-Latin scripts is character-by-character. Only
+  // segment Han text; leave Cyrillic, Greek, Arabic, etc. as complete words.
+  return raw.replace(/\p{Script=Han}+/gu, (text) => ` ${jieba.cutForSearch(text, true).join(" ")} `);
 }
 
 /**

@@ -32,6 +32,8 @@ import type {
   CountOpts,
 } from "./types.js";
 import { BuildQueue } from "./build-queue.js";
+import type { LlmConfig } from "../config.js";
+import { parseGenerationLlmContext, type GenerationLlmContext } from "../llm-context.js";
 import {
   initIndexDb,
   withWriteDb,
@@ -45,6 +47,8 @@ import {
 } from "../engines/wiki/index-db.js";
 
 export interface WikiBuildContext {
+  /** Resolved when enqueued, shared by extraction, merge and summary. */
+  llmConfig?: Readonly<LlmConfig>;
   wikiId: string;
   serviceId: string;
   teamId: string;
@@ -68,7 +72,7 @@ export type WikiWorker = (ctx: WikiBuildContext) => Promise<WikiBuildResult | vo
  *   - busy     正在 pending/processing（并发拒绝，对应 HTTP 409），step 为内部阶段（可 null）。
  */
 export type IngestResult =
-  | { kind: "ok"; row: WikiRow }
+  | { kind: "ok"; row: WikiRow; generation_model?: string }
   | { kind: "not_found" }
   | { kind: "busy"; status: "pending" | "processing"; step: string | null };
 
@@ -84,6 +88,7 @@ export interface WikiServiceOptions {
   worker: WikiWorker;
   queue?: BuildQueue;
   logger?: WikiServiceLogger;
+  resolveJobLlm?: (serviceId: string, context?: GenerationLlmContext) => LlmConfig;
   /** Callback config for TMC status notifications. Optional. */
   callbackConfig?: {
     tmcCallbackUrl: string;
@@ -210,6 +215,7 @@ export class WikiService {
   private readonly worker: WikiWorker;
   private readonly queue: BuildQueue;
   private readonly logger?: WikiServiceLogger;
+  private readonly resolveJobLlm?: WikiServiceOptions["resolveJobLlm"];
   private readonly callbackConfig?: {
     tmcCallbackUrl: string;
     resolveLlm: (serviceId: string) => import("../config.js").LlmConfig;
@@ -228,6 +234,7 @@ export class WikiService {
     this.queue = opts.queue ?? new BuildQueue();
     this.logger = opts.logger;
     this.callbackConfig = opts.callbackConfig;
+    this.resolveJobLlm = opts.resolveJobLlm;
   }
 
   dirFor(serviceId: string, teamId: string, wikiId: string): string {
@@ -269,13 +276,17 @@ export class WikiService {
    * 显式触发 ingest（LLM 加工 raw → page + 建索引）。
    * 立即返回，后台异步执行。memory/team 不匹配返回 not_found；pending/processing 返回 busy。
    */
-  ingest(serviceId: string, teamId: string, wikiId: string, requesterUserId?: string): IngestResult {
+  ingest(serviceId: string, teamId: string, wikiId: string, requesterUserId?: string, llmContext?: GenerationLlmContext): IngestResult {
     const row = this.store.getWiki(serviceId, teamId, wikiId);
     if (!row) return { kind: "not_found" };
     // 并发拒绝：正在排队/执行中直接拒绝，不覆盖状态、不重复入队、不写 audit。
     if (row.status === "pending" || row.status === "processing") {
       return { kind: "busy", status: row.status, step: row.internal_status };
     }
+    const origin = parseGenerationLlmContext(llmContext);
+    if (origin && !this.resolveJobLlm) throw new Error("Origin-model generation resolver is unavailable");
+    const resolved = this.resolveJobLlm?.(serviceId, origin) ?? this.callbackConfig?.resolveLlm(serviceId);
+    const llmSnapshot = resolved ? Object.freeze({ ...resolved }) : undefined;
     const nextVersion = row.version + 1;
     this.store.updateWikiStatus(serviceId, wikiId, {
       status: "pending",
@@ -285,13 +296,13 @@ export class WikiService {
     });
     this.audit({ ...row, version: nextVersion }, "ingest", "manual ingest", requesterUserId);
     const fresh = this.store.getWiki(serviceId, teamId, wikiId);
-    if (fresh) this.enqueueBuild(fresh);
-    return fresh ? { kind: "ok", row: fresh } : { kind: "not_found" };
+    if (fresh) this.enqueueBuild(fresh, llmSnapshot);
+    return fresh ? { kind: "ok", row: fresh, generation_model: llmSnapshot?.model } : { kind: "not_found" };
   }
 
   /** sync 语义 = 重跑 ingest（管控显式触发）。 */
-  sync(serviceId: string, teamId: string, wikiId: string, requesterUserId?: string): IngestResult {
-    return this.ingest(serviceId, teamId, wikiId, requesterUserId);
+  sync(serviceId: string, teamId: string, wikiId: string, requesterUserId?: string, llmContext?: GenerationLlmContext): IngestResult {
+    return this.ingest(serviceId, teamId, wikiId, requesterUserId, llmContext);
   }
 
   get(serviceId: string, teamId: string, wikiId: string): WikiRow | null {
@@ -1007,11 +1018,11 @@ export class WikiService {
 
   // ═══════════════════════════════════════════════════════════════════
 
-  private enqueueBuild(row: WikiRow): void {
-    this.queue.enqueue(row.wiki_id, () => this.runBuild(row.service_id, row.wiki_id, row.team_id, row.name));
+  private enqueueBuild(row: WikiRow, llmConfig?: Readonly<LlmConfig>): void {
+    this.queue.enqueue(row.wiki_id, () => this.runBuild(row.service_id, row.wiki_id, row.team_id, row.name, llmConfig));
   }
 
-  private async runBuild(serviceId: string, wikiId: string, teamId: string, name: string): Promise<void> {
+  private async runBuild(serviceId: string, wikiId: string, teamId: string, name: string, llmConfig?: Readonly<LlmConfig>): Promise<void> {
     // 入口检查点：pending 期间被删 → 跳过，不置 processing、不 ingest。
     if (this.isDeleted(serviceId, wikiId)) {
       this.finishCancelled(serviceId, teamId, wikiId);
@@ -1034,6 +1045,7 @@ export class WikiService {
         setInternalStatus: (s) =>
           this.store.updateWikiStatus(serviceId, wikiId, { status: "processing", internal_status: s }),
         ingestRunId,
+        llmConfig,
       });
       // 结束前检查点：processing 期间被删 → 跳过 ready/audit/回调，幂等收尾清理。
       if (this.isDeleted(serviceId, wikiId)) {
@@ -1054,7 +1066,7 @@ export class WikiService {
       this.logger?.info?.(`[wiki] ${wikiId} ready (pages: ${result?.pageCount ?? '?'})`);
 
       // Auto-generate summary + callback TMC
-      await this.onBuildComplete(synced, "ready", null, ingestRunId);
+      await this.onBuildComplete(synced, "ready", null, ingestRunId, llmConfig);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       // worker 抛错，但若期间已被删，视为取消而非失败：跳过 failed 状态/回调，做清理。
@@ -1085,6 +1097,7 @@ export class WikiService {
     status: "ready" | "failed",
     errorMsg: string | null,
     ingestRunId?: string,
+    llmConfig?: Readonly<LlmConfig>,
   ): Promise<void> {
     if (!row || !this.callbackConfig) return;
 
@@ -1100,7 +1113,7 @@ export class WikiService {
           row.wiki_id,
           row.name,
           pages.map((p) => ({ title: p.title, description: p.description })),
-          this.callbackConfig.resolveLlm(row.service_id),
+          llmConfig ?? this.callbackConfig.resolveLlm(row.service_id),
         );
         this.logger?.info?.(`[wiki] summary generation done (wikiId=${row.wiki_id}, len=${summary?.length ?? 0}, empty=${!summary})`);
         if (summary) {

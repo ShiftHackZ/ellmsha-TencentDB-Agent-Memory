@@ -67,6 +67,8 @@ export interface SceneExtractorOptions {
    * Must be configured with `enableTools: true`.
    */
   llmRunner?: LLMRunner;
+  /** Rethrow origin-model failures so the pipeline can retry without advancing state. */
+  throwOnLlmError?: boolean;
   /** StorageAdapter for file operations (COS/local). Falls back to fs when absent. */
   storage?: StorageAdapter;
   /** langfuse 上报身份四元组（team/user/agent/session）。传下来会填充 trace 顶级字段。 */
@@ -99,6 +101,7 @@ export function parsePersonaUpdateSignal(text: string): { reason: string } | nul
 export class SceneExtractor {
   private dataDir: string;
   private runner: LLMRunner;
+  private throwOnLlmError: boolean;
   private maxScenes: number;
   private sceneBackupCount: number;
   private promptMode: MemoryPromptMode;
@@ -111,6 +114,7 @@ export class SceneExtractor {
 
   constructor(opts: SceneExtractorOptions) {
     this.dataDir = opts.dataDir;
+    this.throwOnLlmError = opts.throwOnLlmError ?? false;
     this.maxScenes = opts.maxScenes ?? 15;
     this.promptMode = opts.promptMode ?? "chat";
     this.memoryPrompt = opts.memoryPrompt;
@@ -292,6 +296,7 @@ export class SceneExtractor {
         }
       }
 
+      if (this.throwOnLlmError) throw err;
       return { memoriesProcessed: 0, success: false, error: errMsg };
     }
 

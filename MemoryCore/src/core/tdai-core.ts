@@ -1,3 +1,4 @@
+import { parseGenerationLlmContext, type GenerationLlmContext } from "./llm-context.js";
 /**
  * TdaiCore — Host-neutral facade for TDAI memory capabilities.
  *
@@ -625,7 +626,7 @@ export class TdaiCore {
    * provider=openai 时透传；provider=proxy 时替换 baseUrl 为 `${baseUrl}/proxy/<iid>/v1`，
    * apiKey 用 env.TDAI_MEMORY_SYSTEM_USER_KEY。四个 runner factory 构造点共用。
    */
-  private resolveRuntimeLlm(): {
+  private resolveRuntimeLlm(origin?: GenerationLlmContext): {
     baseUrl: string;
     apiKey: string;
     model: string;
@@ -633,6 +634,12 @@ export class TdaiCore {
     timeoutMs: number;
     stream: boolean;
   } {
+    if (origin) return {
+      baseUrl: origin.base_url, apiKey: origin.callback_token, model: origin.model,
+      maxTokens: this.cfg.llm.maxTokens ?? 4096,
+      timeoutMs: this.cfg.llm.timeoutMs ?? 300_000,
+      stream: false,
+    };
     const resolved = resolveStandaloneLlmForRuntime(this.cfg.llm, this.instanceId);
     return {
       baseUrl: resolved.baseUrl,
@@ -1051,15 +1058,17 @@ export class TdaiCore {
      * standalone 单进程不需要传（进程内 withFileLock 已足够）。
      */
     checkpointLock?: import("../utils/checkpoint.js").CheckpointLockOptions,
+    llmContext?: GenerationLlmContext,
   ): Promise<{ storedCount: number; creditUsed: number; hasMore: boolean; hasFullBacklog: boolean; profileScopes: string[] }> {
-    const useStandaloneRunner = this.cfg.llm.enabled || this.hostAdapter.hostType !== "openclaw";
+    const origin = parseGenerationLlmContext(llmContext);
+    const useStandaloneRunner = Boolean(origin) || this.cfg.llm.enabled || this.hostAdapter.hostType !== "openclaw";
     const openclawConfig = (!useStandaloneRunner && this.hostAdapter.hostType === "openclaw")
       ? (this.hostAdapter as { getOpenClawConfig?(): unknown }).getOpenClawConfig?.()
       : undefined;
 
     let runnerFactory = this.runnerFactory;
-    if (this.shouldOverrideRunnerFactory(useStandaloneRunner)) {
-      const runtimeLlm = this.resolveRuntimeLlm();
+    if (origin || this.shouldOverrideRunnerFactory(useStandaloneRunner)) {
+      const runtimeLlm = this.resolveRuntimeLlm(origin);
       runnerFactory = new StandaloneLLMRunnerFactory({
         config: runtimeLlm,
         logger: this.logger,
@@ -1086,6 +1095,7 @@ export class TdaiCore {
       llmRunner,
       storage: storage ?? this.getStorage(),
       checkpointLock,
+      throwOnLlmError: Boolean(origin),
     });
     const result = await runner({ sessionKey, msg: [], bg_msg: [] });
 
@@ -1101,15 +1111,16 @@ export class TdaiCore {
   /**
    * Run L2 scene extraction using an externally provided Store.
    */
-  async runL2WithStore(sessionKey: string, store: IMemoryStore, storage?: StorageAdapter, cursor?: string): Promise<{ creditUsed: number; skipped: boolean }> {
-    const useStandaloneRunner = this.cfg.llm.enabled || this.hostAdapter.hostType !== "openclaw";
+  async runL2WithStore(sessionKey: string, store: IMemoryStore, storage?: StorageAdapter, cursor?: string, llmContext?: GenerationLlmContext): Promise<{ creditUsed: number; skipped: boolean }> {
+    const origin = parseGenerationLlmContext(llmContext);
+    const useStandaloneRunner = Boolean(origin) || this.cfg.llm.enabled || this.hostAdapter.hostType !== "openclaw";
     const openclawConfig = (!useStandaloneRunner && this.hostAdapter.hostType === "openclaw")
       ? (this.hostAdapter as { getOpenClawConfig?(): unknown }).getOpenClawConfig?.()
       : undefined;
 
     let runnerFactory = this.runnerFactory;
-    if (this.shouldOverrideRunnerFactory(useStandaloneRunner)) {
-      const runtimeLlm = this.resolveRuntimeLlm();
+    if (origin || this.shouldOverrideRunnerFactory(useStandaloneRunner)) {
+      const runtimeLlm = this.resolveRuntimeLlm(origin);
       runnerFactory = new StandaloneLLMRunnerFactory({
         config: runtimeLlm,
         logger: this.logger,
@@ -1133,6 +1144,7 @@ export class TdaiCore {
       logger: this.logger,
       instanceId: this.instanceId,
       llmRunner,
+      throwOnLlmError: Boolean(origin),
       storage: storage ?? this.getStorage(),
     });
     const runnerResult = await runner(sessionKey, cursor);
@@ -1145,15 +1157,16 @@ export class TdaiCore {
   /**
    * Run L3 persona generation using an externally provided Store.
    */
-  async runL3WithStore(store: IMemoryStore, storage?: StorageAdapter): Promise<{ creditUsed: number }> {
-    const useStandaloneRunner = this.cfg.llm.enabled || this.hostAdapter.hostType !== "openclaw";
+  async runL3WithStore(store: IMemoryStore, storage?: StorageAdapter, llmContext?: GenerationLlmContext): Promise<{ creditUsed: number }> {
+    const origin = parseGenerationLlmContext(llmContext);
+    const useStandaloneRunner = Boolean(origin) || this.cfg.llm.enabled || this.hostAdapter.hostType !== "openclaw";
     const openclawConfig = (!useStandaloneRunner && this.hostAdapter.hostType === "openclaw")
       ? (this.hostAdapter as { getOpenClawConfig?(): unknown }).getOpenClawConfig?.()
       : undefined;
 
     let runnerFactory = this.runnerFactory;
-    if (this.shouldOverrideRunnerFactory(useStandaloneRunner)) {
-      const runtimeLlm = this.resolveRuntimeLlm();
+    if (origin || this.shouldOverrideRunnerFactory(useStandaloneRunner)) {
+      const runtimeLlm = this.resolveRuntimeLlm(origin);
       runnerFactory = new StandaloneLLMRunnerFactory({
         config: runtimeLlm,
         logger: this.logger,
@@ -1177,6 +1190,7 @@ export class TdaiCore {
       logger: this.logger,
       instanceId: this.instanceId,
       llmRunner,
+      throwOnLlmError: Boolean(origin),
       storage: storage ?? this.getStorage(),
     });
     await runner();

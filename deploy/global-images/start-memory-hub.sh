@@ -19,8 +19,12 @@ source "$SCRIPT_DIR/_lib.sh"
 load_env
 require_vars \
   MEMORY_HUB_IMAGE PANEL_PORT KNOWLEDGE_PORT PANEL_VOLUME \
-  MEMORY_LLM_BASE_URL MEMORY_LLM_API_KEY MEMORY_LLM_MODEL \
   KNOWLEDGE_PUBLIC_BASE_URL
+
+# Follow-chat generation is supplied per request; no static model is needed.
+if [[ "${AION_LLM_REQUIRE_CONTEXT:-0}" != "1" ]]; then
+  require_vars MEMORY_LLM_BASE_URL MEMORY_LLM_API_KEY MEMORY_LLM_MODEL
+fi
 
 # 与 memory-core 保持一致的 gateway 内部凭据（默认 local，仅本地体验）
 MEMORY_CORE_GATEWAY_API_KEY="${MEMORY_CORE_GATEWAY_API_KEY:-local}"
@@ -72,6 +76,17 @@ fi
 CONTAINER=tdai-memory-hub
 NETWORK=tdai-memory-stack
 
+# Local code indexing is opt-in. Only the selected workspace is exposed and
+# snapshots/indexes are written to the Knowledge volume, never to this mount.
+LOCAL_SOURCE_ARGS=()
+if [[ -n "${KNOWLEDGE_LOCAL_SOURCE_ROOT:-}" ]]; then
+  [[ -d "$KNOWLEDGE_LOCAL_SOURCE_ROOT" ]] || die "KNOWLEDGE_LOCAL_SOURCE_ROOT must be an existing directory"
+  KNOWLEDGE_LOCAL_SOURCE_ROOT="$(cd "$KNOWLEDGE_LOCAL_SOURCE_ROOT" && pwd -P)"
+  KNOWLEDGE_LOCAL_MOUNT_ROOT="${KNOWLEDGE_LOCAL_MOUNT_ROOT:-/workspaces/ellmsha-v3}"
+  [[ "$KNOWLEDGE_LOCAL_MOUNT_ROOT" == /workspaces/* ]] || die "KNOWLEDGE_LOCAL_MOUNT_ROOT must be under /workspaces/"
+  LOCAL_SOURCE_ARGS=(-v "$KNOWLEDGE_LOCAL_SOURCE_ROOT:$KNOWLEDGE_LOCAL_MOUNT_ROOT:ro" -e "KNOWLEDGE_LOCAL_ROOTS=$KNOWLEDGE_LOCAL_MOUNT_ROOT")
+fi
+
 if ! $DOCKER network inspect "$NETWORK" >/dev/null 2>&1; then
   info "创建 docker 网络 $NETWORK"
   $DOCKER network create "$NETWORK" >/dev/null
@@ -91,11 +106,14 @@ rm_container_if_exists "$CONTAINER"
 info "启动 memory-hub (image=$MEMORY_HUB_IMAGE, panel=$PANEL_PORT knowledge=$KNOWLEDGE_PORT)"
 $DOCKER run -d --name "$CONTAINER" \
   --network "$NETWORK" \
+  -e AION_LLM_REQUIRE_CONTEXT="${AION_LLM_REQUIRE_CONTEXT:-0}" \
+  -e AION_LLM_CALLBACK_ALLOWED_HOSTS="${AION_LLM_CALLBACK_ALLOWED_HOSTS:-host.docker.internal,localhost,127.0.0.1,[::1],aionui,aionui-core}" \
   --network-alias memory-hub \
   --add-host=host.docker.internal:host-gateway \
-  -p "${PANEL_PORT}:8125" \
-  -p "${KNOWLEDGE_PORT}:8424" \
+  -p "${TDAI_BIND_HOST:-0.0.0.0}:${PANEL_PORT}:8125" \
+  -p "${TDAI_BIND_HOST:-0.0.0.0}:${KNOWLEDGE_PORT}:8424" \
   -v "${PANEL_VOLUME}:/data/knowledge" \
+  ${LOCAL_SOURCE_ARGS[@]+"${LOCAL_SOURCE_ARGS[@]}"} \
   -e PANEL_PORT=8125 \
   -e KNOWLEDGE_PORT=8424 \
   -e KNOWLEDGE_PUBLIC_BASE_URL="$KNOWLEDGE_PUBLIC_BASE_URL" \
@@ -108,9 +126,9 @@ $DOCKER run -d --name "$CONTAINER" \
   -e REMOTE_INSTANCE_PROXY_URL="$MEMORY_HUB_PROXY_PUBLIC_URL" \
   -e LLM_MODE=custom \
   -e LLM_PROTOCOL="${MEMORY_LLM_PROTOCOL:-openai}" \
-  -e LLM_API_KEY="$MEMORY_LLM_API_KEY" \
-  -e LLM_BASE_URL="$MEMORY_LLM_BASE_URL" \
-  -e LLM_MODEL="$MEMORY_LLM_MODEL" \
+  -e LLM_API_KEY="${MEMORY_LLM_API_KEY:-}" \
+  -e LLM_BASE_URL="${MEMORY_LLM_BASE_URL:-}" \
+  -e LLM_MODEL="${MEMORY_LLM_MODEL:-}" \
   -e KNOWLEDGE_LLM_BINDING_SYNC=0 \
   "$MEMORY_HUB_IMAGE" >/dev/null
 

@@ -178,7 +178,14 @@ memory:
   # 此处保持同值仅为可读性；插件/SDK 形态才读这个字段。
   storeBackend: ${MEMORY_CORE_STORE_MODE}
   embedding:
-    provider: none
+    provider: ${MEMORY_EMBEDDING_PROVIDER:-none}
+    baseUrl: "${MEMORY_EMBEDDING_BASE_URL:-http://host.docker.internal:11434/v1}"
+    apiKey: "${MEMORY_EMBEDDING_API_KEY:-ollama}"
+    model: "${MEMORY_EMBEDDING_MODEL:-bge-m3}"
+    dimensions: ${MEMORY_EMBEDDING_DIMENSIONS:-1024}
+    sendDimensions: false
+    maxInputChars: 8192
+    timeoutMs: 60000
 
 # ── Skill 模块 ──
 skill:
@@ -204,7 +211,10 @@ info "启动 memory-core (image=$MEMORY_CORE_IMAGE, port=$MEMORY_CORE_PORT)"
 $DOCKER run -d --name "$CONTAINER" \
   --network "$NETWORK" \
   --network-alias memory-core \
-  -p "${MEMORY_CORE_PORT}:8420" \
+  -e AION_LLM_REQUIRE_CONTEXT="${AION_LLM_REQUIRE_CONTEXT:-0}" \
+  -e AION_LLM_CALLBACK_ALLOWED_HOSTS="${AION_LLM_CALLBACK_ALLOWED_HOSTS:-host.docker.internal,localhost,127.0.0.1,[::1],aionui,aionui-core}" \
+  --add-host=host.docker.internal:host-gateway \
+  -p "${TDAI_BIND_HOST:-0.0.0.0}:${MEMORY_CORE_PORT}:8420" \
   -v "${MEMORY_CORE_VOLUME}:/data/tdai-memory" \
   -v "$CORE_CONFIG_FILE:/data/config/tdai-gateway.yaml:ro" \
   -e TDAI_GATEWAY_PORT=8420 \

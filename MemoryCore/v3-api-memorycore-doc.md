@@ -116,7 +116,10 @@ v3 接口按鉴权方式分四层（均需 `Authorization: Bearer <KERNEL_AUTH_T
 |---|---|---|---|
 | session_id | string | 是 | 业务会话 ID |
 | messages | object[] | 是 | 1–100 条，`{ role: "user"\|"assistant", content: 1–8192 字, timestamp?, recorded_at? }` |
+| llm_context | object | When `AION_LLM_REQUIRE_CONTEXT=1` | Origin-agent model snapshot: `{base_url, model, callback_token}`. `base_url` must use an allowed callback host and exact `/api/runtime/tencent/v1` path; `model` is the selected model (1–256 chars); `callback_token` is a scoped 16–512 character runtime capability, never a provider key. No URL credentials/query/fragment. Validated before L0 writes; invalid/missing context returns 422. Captured across L1 extraction, L2 scenarios and L3 persona jobs; callback failures never fall back to the global model. |
 | team_id / agent_id / user_id / task_id | string | 否* | 隔离字段（*v3 强制 team+agent+user，缺省回落 default 桶） |
+
+Pending session/profile timers aggregate source messages or L1 contributions. The latest contributing capture/L1 completion supplies that aggregation’s model snapshot. Once a job is queued, later model changes cannot alter it; retries, backlog drains and L3 continuations inherit its snapshot. Origin capabilities are excluded from durable conversation/checkpoint records. After runtime restart/expiry, callbacks fail explicitly and require a new origin context. Origin-model L1/L2/L3 callback exceptions propagate to worker retries; failed generations do not count as completed work or advance their extraction/persona checkpoints. Valid empty results retain upstream completion behavior.
 
 **响应** `data`
 
@@ -125,6 +128,7 @@ v3 接口按鉴权方式分四层（均需 `Authorization: Bearer <KERNEL_AUTH_T
 | accepted_ids | string[] | 已接收消息 ID |
 | accepted_versions | string[] | 与 accepted_ids 同序，新建固定 `v1` |
 | total_count | number | 接收总数 |
+| generation_model | string? | Accepted origin model, when supplied. The callback token is never returned. |
 
 **示例**
 
@@ -237,7 +241,10 @@ L0 计数（**仅 v3，无 v2 入口**）。
 
 **请求体**：`query`(1–2048)、`limit?`(默认5/上限100)、`type?`、`time_start?`、`time_end?` + 隔离字段。
 
-**响应** `data`：`{ items: (AtomicDetail & { score })[] }`。
+**响应** `data`：`{ items: (AtomicDetail & { score, source_path? })[] }`。
+
+eLLMsha extension: `source_path` is the optional relative L2 document path. Use
+`scenario/read` to load the complete source after a bounded search excerpt.
 
 ### POST /v3/atomic/delete
 
@@ -282,6 +289,20 @@ L2 场景文件列表（一次性全量列举，无分页）。
 **请求体**：`path`、`content`、`summary?` + 隔离字段。
 
 **响应** `data`：`{ path, version, updated_at }`。
+
+eLLMsha supports synchronous searchable document writes with these optional fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `index_content` | string, 1–8192 characters | Durable excerpt to index immediately in L1 and, when configured, the embedding store. |
+| `index_type` | `episodic` / `persona` / `instruction` | Excerpt kind, defaults to `episodic`. Used with `index_content`. |
+| response `memory_id` | string, optional | Stable searchable record ID, returned only after requested indexing succeeds. |
+
+The index identity includes the owner and document path; repeated writes update
+the same record. Removing a document removes its associated searchable record.
+If indexing fails after the document was saved, the response is HTTP 503 and
+explicitly reports partial completion. Retry the same path and content to finish.
+Clients omitting `index_content` retain the original L2-only write behavior.
 
 ### POST /v3/scenario/rm
 

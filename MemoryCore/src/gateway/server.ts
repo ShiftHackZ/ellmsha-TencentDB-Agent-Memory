@@ -1,3 +1,4 @@
+import { parseGenerationLlmContext, type GenerationLlmContext } from "../core/llm-context.js";
 /**
  * TDAI Gateway — HTTP server for the Hermes sidecar.
  *
@@ -1044,8 +1045,9 @@ export class TdaiGateway {
             rounds: number,
             teamId?: string,
             agentId?: string,
+            llmContext?: GenerationLlmContext,
           ) => {
-            await pipelineManager.notifyConversation(sessionId, [], instanceId, rounds, teamId, agentId);
+            await pipelineManager.notifyConversation(sessionId, [], instanceId, rounds, teamId, agentId, llmContext);
           };
         }
 
@@ -1789,7 +1791,9 @@ export class TdaiGateway {
             createdAt: now,
             data: { triggeredBy: "timer_scanner", timerMember: member, instanceId, targetMmdFile, teamId, agentId },
           };
-          this.stateBackend!.enqueueTask(task).then(() => {
+          this.stateBackend!.getSessionState(instanceId, sessionId, teamId, agentId).then((state) =>
+            this.stateBackend!.enqueueTask({ ...task, data: { ...task.data, llm_context: state?.llm_context } }),
+          ).then(() => {
             this.logger.info(`[local-timer] Timer fired: ${member} → enqueued ${taskType} task`);
           }).catch((err) => {
             this.logger.error(`[local-timer] Failed to enqueue task for ${member}: ${err instanceof Error ? err.message : String(err)}`);
@@ -2926,6 +2930,7 @@ export class TdaiGateway {
           embedding,
           storage ?? undefined,
           resolveCheckpointLock(instanceId),
+          parseGenerationLlmContext(task.data?.llm_context),
         );
 
         (task as any)._l2ProfileScopes = result.profileScopes;
@@ -2949,7 +2954,7 @@ export class TdaiGateway {
         // See pipeline-factory.ts createL1Runner for the full state machine.
         if (gateway.statefulPipelineManager) {
           if (result.hasFullBacklog) {
-            gateway.statefulPipelineManager.enqueueL1Drain(task.sessionId, instanceId, teamId, agentId).catch((err) => {
+            gateway.statefulPipelineManager.enqueueL1Drain(task.sessionId, instanceId, teamId, agentId, parseGenerationLlmContext(task.data?.llm_context)).catch((err) => {
               gateway.logger.warn(`[executor] L1 drain enqueue failed: ${err instanceof Error ? err.message : String(err)}`);
             });
           } else if (result.hasMore) {
@@ -3002,7 +3007,7 @@ export class TdaiGateway {
           } catch { /* ok */ }
         }
 
-        const result = await core.runL2WithStore(task.sessionId, store, storage ?? undefined, cursor);
+        const result = await core.runL2WithStore(task.sessionId, store, storage ?? undefined, cursor, parseGenerationLlmContext(task.data?.llm_context));
 
         // Mark task as skipped if L2 had no new records to process
         if (result.skipped) {
@@ -3056,7 +3061,7 @@ export class TdaiGateway {
 
         core.setInstanceId(instanceId);
         const { store } = await resolveStore(task);
-        const result = await core.runL3WithStore(store, storage ?? undefined);
+        const result = await core.runL3WithStore(store, storage ?? undefined, parseGenerationLlmContext(task.data?.llm_context));
 
         // Report credit + memory (only +1 on first persona creation)
         // provider=proxy 模式下 credit 由 context_proxy 上报，此处仅报 memory delta。

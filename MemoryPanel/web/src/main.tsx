@@ -29,6 +29,22 @@ import './tea-override.css';
   }
 })();
 
+// Native embedding supplies its current appearance; standalone follows the OS.
+const appearance = window.matchMedia('(prefers-color-scheme: dark)');
+let suppliedTheme = new URL(window.location.href).searchParams.get('theme');
+function applyAppearance() {
+  const mode = suppliedTheme === 'dark' || suppliedTheme === 'light' ? suppliedTheme : appearance.matches ? 'dark' : 'light';
+  document.documentElement.setAttribute('theme-mode', mode);
+  document.documentElement.classList.toggle('dark', mode === 'dark');
+  document.documentElement.style.colorScheme = mode;
+}
+window.addEventListener('ellmsha-theme', event => {
+  const value = (event as CustomEvent<unknown>).detail;
+  if (value === 'dark' || value === 'light') { suppliedTheme = value; applyAppearance(); }
+});
+appearance.addEventListener('change', applyAppearance);
+applyAppearance();
+
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <App />

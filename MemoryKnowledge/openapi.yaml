@@ -176,6 +176,12 @@ paths:
                             type: string
                           status:
                             type: string
+                            description: Accepted background build status.
+                          generation_model:
+                            type: string
+                            description: Effective model snapshot used by this build (contains no callback token).
+        '422':
+          description: Missing required origin context or disallowed callback URL.
         '404':
           description: Wiki not found
         default:
@@ -848,12 +854,37 @@ components:
         total:
           type: integer
 
+    GenerationLlmContext:
+      type: object
+      additionalProperties: false
+      required: [base_url, model, callback_token]
+      description: Immutable origin-agent model routing for this background job. Required when AION_LLM_REQUIRE_CONTEXT=1; never silently falls back on callback failure.
+      properties:
+        base_url:
+          type: string
+          maxLength: 2048
+          description: OpenAI-compatible callback base URL on an AION_LLM_CALLBACK_ALLOWED_HOSTS host, exact path /api/runtime/tencent/v1. No URL credentials, query or fragment.
+        model:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Selected origin-agent model identifier, retained for extraction, merge and summary.
+        callback_token:
+          type: string
+          minLength: 16
+          maxLength: 512
+          writeOnly: true
+          description: Scoped callback capability issued by the originating runtime; never a provider API key. Not returned in API responses.
+
     WikiIngestRequest:
       type: object
       required: [wiki_id]
       properties:
         wiki_id:
           type: string
+          description: Existing Wiki asset whose raw sources will be ingested.
+        llm_context:
+          $ref: '#/components/schemas/GenerationLlmContext'
 
     WikiDeleteRequest:
       type: object
@@ -1011,11 +1042,13 @@ components:
           type: string
         repo_url:
           type: string
+          description: HTTPS Git repository, or an allowlisted local Git workspace path/file URL when KNOWLEDGE_LOCAL_ROOTS is configured.
         branch:
           type: string
         commit_hash:
           type: string
           nullable: true
+          description: Git commit hash, or a content digest for a local workspace snapshot (including uncommitted files).
         service_url:
           type: string
           nullable: true
@@ -1055,9 +1088,11 @@ components:
           properties:
             repo_url:
               type: string
+              description: HTTPS Git repository, or an absolute path/file URL under KNOWLEDGE_LOCAL_ROOTS. Local sources must be Git workspaces; snapshots include uncommitted source and exclude ignored, secret, generated, and symlinked files.
             branch:
               type: string
               default: main
+              description: Git branch to clone. Ignored for local workspaces, which snapshot their current working tree.
             repo_name:
               type: string
 

@@ -175,6 +175,7 @@ import {
   bm25RankToScore,
   _resetJiebaForTest,
   _setJiebaForTest,
+  FTS_TOKENIZER_VERSION,
 } from "../tokenize.js";
 
 export { buildFtsQuery, tokenizeForFts, bm25RankToScore, _resetJiebaForTest, _setJiebaForTest };
@@ -582,8 +583,8 @@ export class VectorStore implements IMemoryStore {
     this.stmtDeleteMeta = this.db.prepare("DELETE FROM l1_records WHERE record_id = ?");
 
     this.stmtGetMeta = this.db.prepare(`
-      SELECT content, type, priority, scene_name, session_key, session_id, team_id, task_id, user_id, agent_id,
-             version, timestamp_str, timestamp_start, timestamp_end, metadata_json
+      SELECT record_id, content, type, priority, scene_name, session_key, session_id, team_id, task_id, user_id, agent_id,
+             version, timestamp_str, timestamp_start, timestamp_end, created_time, updated_time, metadata_json
       FROM l1_records WHERE record_id = ?
     `);
 
@@ -1026,9 +1027,12 @@ export class VectorStore implements IMemoryStore {
       this.ftsAvailable = true;
       this.logger?.debug?.(`${TAG} FTS5 tables initialized (l1_fts, l0_fts) [schema v2 — jieba segmented]`);
 
-      // Rebuild FTS index if migrated from v1 or tables were freshly created
-      if (needsFtsRebuild) {
-        this.rebuildFtsIndex();
+      this.db.exec("CREATE TABLE IF NOT EXISTS fts_tokenizer_versions (name TEXT PRIMARY KEY, version INTEGER NOT NULL)");
+      const tokenizer = this.db.prepare("SELECT version FROM fts_tokenizer_versions WHERE name = 'memory'").get() as { version: number } | undefined;
+      // Existing indexes must use the same tokenizer as new queries.
+      if (needsFtsRebuild || tokenizer?.version !== FTS_TOKENIZER_VERSION) {
+        if (!this.rebuildFtsIndex()) throw new Error("FTS tokenizer migration failed; will retry on next startup");
+        this.db.prepare("INSERT OR REPLACE INTO fts_tokenizer_versions (name, version) VALUES ('memory', ?)").run(FTS_TOKENIZER_VERSION);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -1647,12 +1651,21 @@ export class VectorStore implements IMemoryStore {
       return [];
     }
     try {
-      const { sessionKey, sessionId, taskId, updatedAfter } = filter ?? {};
+      const { sessionKey, sessionId, taskId, updatedAfter, recordIds } = filter ?? {};
 
       let raw: Record<string, unknown>[];
 
       // Priority: sessionId > sessionKey (sessionId is more specific)
-      if (sessionId && updatedAfter) {
+      if (recordIds !== undefined) {
+        // Callers use this for read-modify-write. Ignoring IDs can update an
+        // unrelated first row; use indexed point reads and keep all filters.
+        raw = [...new Set(recordIds)]
+          .map((id) => this.stmtGetMeta.get(id) as Record<string, unknown> | undefined)
+          .filter((row): row is Record<string, unknown> => !!row)
+          .filter((row) => !sessionId || row.session_id === sessionId)
+          .filter((row) => !!sessionId || !sessionKey || row.session_key === sessionKey)
+          .filter((row) => !updatedAfter || String(row.updated_time) > updatedAfter);
+      } else if (sessionId && updatedAfter) {
         raw = this.stmtQueryBySessionIdSince.all(sessionId, updatedAfter) as Record<string, unknown>[];
       } else if (sessionId) {
         raw = this.stmtQueryBySessionId.all(sessionId) as Record<string, unknown>[];
@@ -3186,11 +3199,12 @@ export class VectorStore implements IMemoryStore {
    *
    * Safe to call multiple times (idempotent — clears FTS tables first).
    */
-  rebuildFtsIndex(): void {
-    if (!this.ftsAvailable) return;
+  rebuildFtsIndex(): boolean {
+    if (!this.ftsAvailable) return false;
 
     try {
       this.logger?.info(`${TAG} Rebuilding FTS5 index with jieba segmentation…`);
+      this.db.exec("BEGIN");
 
       // ── Rebuild L1 FTS ──
       // Clear existing FTS data
@@ -3302,13 +3316,20 @@ export class VectorStore implements IMemoryStore {
         }
       }
 
+      if (l1Count !== l1Rows.length || l0Count !== l0Rows.length) {
+        throw new Error("Incomplete FTS rebuild; retaining the previous index");
+      }
+      this.db.exec("COMMIT");
       this.logger?.info(
         `${TAG} FTS5 rebuild complete: L1=${l1Count}/${l1Rows.length}, L0=${l0Count}/${l0Rows.length}`,
       );
+      return true;
     } catch (err) {
+      try { this.db.exec("ROLLBACK"); } catch { /* no active transaction */ }
       this.logger?.warn(
         `${TAG} FTS5 rebuild failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
       );
+      return false;
     }
   }
 

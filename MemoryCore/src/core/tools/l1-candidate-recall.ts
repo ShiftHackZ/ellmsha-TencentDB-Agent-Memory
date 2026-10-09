@@ -10,7 +10,7 @@
  */
 
 import type { IMemoryStore, IsolationFilter, L1FtsResult, L1SearchResult } from "../store/types.js";
-import { buildFtsQuery } from "../store/tokenize.js";
+import { buildFtsQuery, extractQueryTokens } from "../store/tokenize.js";
 import { hasClientEmbedding, type EmbeddingService } from "../store/embedding.js";
 import type { Logger } from "../types.js";
 
@@ -104,7 +104,7 @@ export async function recallL1Candidates(
   }
 
   if (strategy === "hybrid") {
-    const merged = rrfMergeL1Hits(ftsHits, vecHits);
+    const merged = rrfMergeL1Hits(query, ftsHits, vecHits);
     logger?.debug?.(
       `${tag} [hybrid] RRF merged: fts=${ftsHits.length}, vec=${vecHits.length} → ${merged.length} unique`,
     );
@@ -144,13 +144,23 @@ function toL1Hit(r: L1SearchResult | L1FtsResult): L1SearchResult {
   };
 }
 
-function rrfMergeL1Hits(...lists: L1SearchResult[][]): L1SearchResult[] {
+function rrfMergeL1Hits(query: string, ftsHits: L1SearchResult[], vecHits: L1SearchResult[]): L1SearchResult[] {
   const map = new Map<string, { item: L1SearchResult; rrfScore: number }>();
+  const queryTokens = extractQueryTokens(query);
 
-  for (const list of lists) {
+  for (const [index, list] of [ftsHits, vecHits].entries()) {
     for (let rank = 0; rank < list.length; rank++) {
       const item = list[rank];
-      const score = 1 / (RRF_K + rank + 1);
+      let weight = 1;
+      if (index === 0 && queryTokens.length > 0) {
+        const words = new Set(extractQueryTokens(item.content));
+        const coverage = queryTokens.filter((token) => words.has(token)).length / queryTokens.length;
+        // OR-based FTS may match only one product name in a long multilingual
+        // question. Such a partial match must not swamp semantic top matches
+        // merely by appearing in both lists. Exact keyword queries keep weight 1.
+        weight = coverage * coverage;
+      }
+      const score = weight / (RRF_K + rank + 1);
       const existing = map.get(item.record_id);
       if (existing) {
         existing.rrfScore += score;

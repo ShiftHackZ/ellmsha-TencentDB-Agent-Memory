@@ -130,6 +130,8 @@ export async function extractL1Memories(params: {
      * a CleanContextRunner (decouples from OpenClaw runtime).
      */
     llmRunner?: LLMRunner;
+    /** Preserve retryability: an unavailable origin model must not advance the L0 cursor. */
+    throwOnLlmError?: boolean;
   };
   logger?: Logger;
   /** Plugin instance ID for metric reporting (optional — metrics skipped if absent) */
@@ -213,6 +215,7 @@ export async function extractL1Memories(params: {
     logger?.warn?.(
       `${TAG} l1-empty reason=llm_error sessionKey=${sessionKey} msg=${err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200)}`,
     );
+    if (options.throwOnLlmError) throw err;
     return { success: false, extractedCount: 0, storedCount: 0, records: [], sceneNames: [] };
   }
 

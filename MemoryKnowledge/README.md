@@ -5,6 +5,27 @@
 
 默认端口 **8421**，API 前缀 **`/v3`**。
 
+## eLLMsha: local code workspaces
+
+CodeGraph also accepts `repo_url: "file:///workspaces/ellmsha-v3/aionui"`.
+Set `KNOWLEDGE_LOCAL_ROOTS` to a path-delimited allowlist of existing Git workspaces
+inside the service. Local access is disabled when this setting is empty.
+The combined launcher accepts `KNOWLEDGE_LOCAL_SOURCE_ROOT` (host directory) and
+`KNOWLEDGE_LOCAL_MOUNT_ROOT` (default `/workspaces/ellmsha-v3`) and mounts only that
+directory read-only. Build the fork image with `IMAGE_NAME=ellmsha-memory-hub
+IMAGE_TAG=local PLATFORM=linux/arm64 bash deploy/panel-knowledge-combined/build.sh`
+from the repository root (use the target architecture for other hosts).
+
+Local snapshots include the current working tree and untracked source, respect
+Git ignore rules, traverse nested Git forks, and skip symlinks, credentials,
+`.env*`, `.git`, dependency/build/cache folders and files over 2 MiB. Snapshots are
+limited to 20,000 files; select a smaller source directory for larger workspaces.
+The source stays unchanged; copied files and generated indexes live in the
+Knowledge data volume. `branch` is ignored for local sources. `commit_hash` is a
+content digest, so uncommitted changes produce a new version after `/code-graph/sync`.
+Creation and sync are asynchronous; poll `/code-graph/get` until `status: ready`,
+then discover the existing read tools through `/tools/list`.
+
 ## 做什么
 
 | 能力 | 说明 |

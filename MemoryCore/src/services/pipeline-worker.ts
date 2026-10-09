@@ -1021,7 +1021,10 @@ export class PipelineWorker {
       const l2Keys = profileScopes.length > 0 ? profileScopes : [task.sessionId];
       if (this.config.onL1Complete) {
         for (const l2Key of l2Keys) {
-          await this.backend.updateSessionState(task.instanceId, l2Key, { l2_pending_l1_count: 1 }, tid, aid);
+          await this.backend.updateSessionState(task.instanceId, l2Key, {
+            l2_pending_l1_count: 1,
+            llm_context: task.data?.llm_context as import("../core/llm-context.js").GenerationLlmContext | undefined,
+          }, tid, aid);
           // Timer advancement is part of successful L1 completion. Propagate
           // failures so the original PEL message is atomically replaced by a
           // retry instead of ACKing a task whose L2 continuation was lost.

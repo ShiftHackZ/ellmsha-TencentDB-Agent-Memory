@@ -394,6 +394,8 @@ export function createL1Runner(opts: {
   getInstanceId?: () => string | undefined;
   /** Host-neutral LLM runner for L1 extraction (standalone/gateway mode). */
   llmRunner?: import("../core/types.js").LLMRunner;
+  /** Origin-model callback failures must leave the extraction checkpoint unchanged. */
+  throwOnLlmError?: boolean;
   /** StorageAdapter for file operations (COS/local). */
   storage?: StorageAdapter;
   /**
@@ -627,6 +629,7 @@ export function createL1Runner(opts: {
             conflictRecallTopK: cfg.embedding.conflictRecallTopK,
             embeddingTimeoutMs: cfg.embedding.captureTimeoutMs ?? cfg.embedding.timeoutMs,
             llmRunner,
+            throwOnLlmError: opts.throwOnLlmError,
           },
           logger,
           instanceId: getInstanceId?.(),
@@ -709,6 +712,8 @@ export function createL2Runner(opts: {
   instanceId?: string;
   /** Host-neutral LLM runner for L2 scene extraction (standalone/gateway mode). Must have enableTools=true. */
   llmRunner?: import("../core/types.js").LLMRunner;
+  /** Origin-model failures must reach the worker retry path. */
+  throwOnLlmError?: boolean;
   /** StorageAdapter for file operations (COS/local). */
   storage?: StorageAdapter;
   /**
@@ -818,6 +823,7 @@ export function createL2Runner(opts: {
         logger,
         instanceId,
         llmRunner,
+        throwOnLlmError: opts.throwOnLlmError,
         storage: groupStorage,
         // langfuse: 透传身份四元组，UI 上可按 user/session 列过滤
         traceContext: { teamId: ctx.teamId, userId: ctx.userId, agentId: ctx.agentId, sessionId: ctx.sessionId },
@@ -957,6 +963,8 @@ export function createL3Runner(opts: {
   instanceId?: string;
   /** Host-neutral LLM runner for L3 persona generation (standalone/gateway mode). Must have enableTools=true. */
   llmRunner?: import("../core/types.js").LLMRunner;
+  /** Origin-model failures must reach the worker retry path. */
+  throwOnLlmError?: boolean;
   /** StorageAdapter for file operations (COS/local). */
   storage?: StorageAdapter;
 }): L3Runner {
@@ -1035,6 +1043,7 @@ export function createL3Runner(opts: {
         logger,
         instanceId,
         llmRunner,
+        throwOnLlmError: opts.throwOnLlmError,
         storage: scopedStore,
         traceContext: scopeIsolation,
       });

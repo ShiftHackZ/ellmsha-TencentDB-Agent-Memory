@@ -30,10 +30,10 @@ export interface ParseResult {
 }
 
 /**
- * 开标签：标准为 >>>；模型偶发漏写一个 > 变成 >>。
- * 接受 ≥2 个收尾 >，避免「长输出但 files=0」。
+ * Opening marker: models may shorten the >>> suffix to >> or >. The
+ * quoted path, FILE prefix, closing END marker and path allowlist still apply.
  */
-const OPEN_RE = /<<<FILE\s+path\s*=\s*"([^"]*)"\s*>>+/g;
+const OPEN_RE = /<<<FILE\s+path\s*=\s*"([^"]*)"\s*>+/g;
 /**
  * 闭标签：标准为 <<<END>>>；模型偶发拆成 <<<\nEND>>>。
  * 仅放宽 END 两侧空白（含换行），仍要求字面 END。

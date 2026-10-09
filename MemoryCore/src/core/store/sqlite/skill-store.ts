@@ -18,7 +18,7 @@ import type { DatabaseSync } from "node:sqlite";
 
 import { randomBase62 } from "../../../utils/short-id.js";
 import { SKILLS_DDL, SKILL_FTS_DDL, SKILL_VEC_DDL_TEMPLATE, FTS_CONTENT_MAX } from "../../skill/skill-store-ddl.js";
-import { buildFtsQuery, tokenizeForFts } from "../tokenize.js";
+import { buildFtsQuery, tokenizeForFts, FTS_TOKENIZER_VERSION } from "../tokenize.js";
 import type { ISkillStore, ExpiredVersionMeta, SkillStoreCapabilities, SkillSearchResult } from "../../skill/skill-store.interface.js";
 import { SkillStoreError } from "../../skill/skill-store.interface.js";
 import type {
@@ -188,7 +188,9 @@ export class SqliteSkillStore implements ISkillStore {
     const colNames = new Set(cols.map((c) => c.name));
 
     // 新版需要 owner_agent_id / task_id / user_id，旧版只有 5 列缺这 3 个
-    if (colNames.has("owner_agent_id")) return; // 已是新版 schema，无需迁移
+    this.db.exec("CREATE TABLE IF NOT EXISTS fts_tokenizer_versions (name TEXT PRIMARY KEY, version INTEGER NOT NULL)");
+    const tokenizer = this.db.prepare("SELECT version FROM fts_tokenizer_versions WHERE name = 'skills'").get() as { version: number } | undefined;
+    if (colNames.has("owner_agent_id") && colNames.has("task_id") && colNames.has("user_id") && tokenizer?.version === FTS_TOKENIZER_VERSION) return;
 
     this.logger?.info("[skill-store] migrating skill_fts schema: old columns missing owner_agent_id/task_id/user_id");
 
@@ -233,6 +235,7 @@ export class SqliteSkillStore implements ISkillStore {
         );
       }
 
+      this.db.prepare("INSERT OR REPLACE INTO fts_tokenizer_versions (name, version) VALUES ('skills', ?)").run(FTS_TOKENIZER_VERSION);
       this.db.exec("COMMIT");
       this.logger?.info(`[skill-store] fts migration done: rebuilt skill_fts with ${headRows.length} head rows`);
     } catch (e) {
