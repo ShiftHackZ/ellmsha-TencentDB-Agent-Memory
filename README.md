@@ -1,3 +1,45 @@
+<!-- ELLMSHA FORK INTRO -->
+# TencentDB Agent Memory — eLLMsha integration fork
+
+**Durable memory, knowledge synthesis and source-code indexes.**
+
+| Provenance | Value |
+| --- | --- |
+| Original project | [TencentDB Agent Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory) |
+| Upstream baseline | `8b86874` |
+| Baseline revision | `8b86874a2daea49e3ff0fb53d699203146c5c77d` |
+| Harness patch label | 1 |
+
+## Why this fork exists
+
+Selected-chat generation callbacks, native desktop service packaging and project-aware code indexing.
+
+```mermaid
+flowchart LR
+  Harness[eLLMsha harness] --> Component[TencentDB Agent Memory]
+  Component --> Work[Project work]
+```
+
+## Build and integration
+
+Desktop uses bundled native services without Docker. VPS deployments can run the memory containers on a private network with persistent volumes.
+
+The parent repository's installer and integration checks are authoritative for the bundled product. A passing upstream test suite alone does not prove eLLMsha integration acceptance. This local documentation update does not publish a release or make unpublished revisions available remotely.
+
+## Contributing
+
+Keep changes focused, preserve upstream licenses and notices, and separate an upstream version update from a harness patch. Record both in the parent application's About provenance. Do not commit credentials, user profiles or commercial project contents. Validate behavior on the platform being changed.
+
+## License and credits
+
+See [LICENSE](LICENSE). Original authors and their license terms remain unchanged. **Moroz Inc.** maintains the eLLMsha integration.
+
+---
+
+## Upstream documentation
+
+<!-- END ELLMSHA FORK INTRO -->
+
 
 <div align="center">
 

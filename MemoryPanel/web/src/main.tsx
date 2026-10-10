@@ -8,6 +8,7 @@ import 'tea-component/dist/themes/default-pack.css';
 import 'tea-component/dist/tea-themeable.css';
 import './index.css';
 import './tea-override.css';
+import { startMemoryThemeBridge } from './theme';
 
 // WOA SSO 认证后会把授权码挂在站点地址上（?code=...&state=...）跳回。
 // 会话已由后端 Cookie 建立，前端无需该参数，登录完成后清理地址栏，避免 code 残留/被复制分享。
@@ -29,24 +30,11 @@ import './tea-override.css';
   }
 })();
 
-// Native embedding supplies its current appearance; standalone follows the OS.
-const appearance = window.matchMedia('(prefers-color-scheme: dark)');
-let suppliedTheme = new URL(window.location.href).searchParams.get('theme');
-function applyAppearance() {
-  const mode = suppliedTheme === 'dark' || suppliedTheme === 'light' ? suppliedTheme : appearance.matches ? 'dark' : 'light';
-  document.documentElement.setAttribute('theme-mode', mode);
-  document.documentElement.classList.toggle('dark', mode === 'dark');
-  document.documentElement.style.colorScheme = mode;
-}
-window.addEventListener('ellmsha-theme', event => {
-  const value = (event as CustomEvent<unknown>).detail;
-  if (value === 'dark' || value === 'light') { suppliedTheme = value; applyAppearance(); }
-});
-appearance.addEventListener('change', applyAppearance);
-applyAppearance();
+// Native/web embedding supplies its palette live; standalone follows the OS.
+startMemoryThemeBridge();
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <App />
-  </React.StrictMode>
+  </React.StrictMode>,
 );
