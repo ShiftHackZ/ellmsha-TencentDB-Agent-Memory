@@ -392,6 +392,8 @@ export interface L1PaginatedFilter extends L1CountFilter {
 
 /** Result of v2 L1 paginated query. */
 export interface L1PaginatedResult {
+  /** Sanitized backend failure; empty rows alone must not claim a complete census. */
+  error?: "store_degraded" | "query_failed";
   rows: L1RecordRow[];
   /** Total count matching filters (for pagination). */
   total: number;

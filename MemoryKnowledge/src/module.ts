@@ -21,7 +21,9 @@ import {
   type ILlmBindingStore,
 } from "./store/llm-binding-store.js";
 import { createWikiSourceManager, type WikiSourceManager } from "./engines/wiki/index.js";
-import { indexProject, openIndex, syncIndex, getStats, closeIndex, type CodeGraphInstance } from "./engines/code/index.js";
+import { indexProject, openIndex, syncIndex, getStats, closeIndex } from "./engines/code/index.js";
+import { createCodeGraphInstancePool, type CodeGraphInstancePool } from "./engines/code/runtime-pool.js";
+export type { CodeGraphInstancePool } from "./engines/code/runtime-pool.js";
 import { SourceFetcherRegistry } from "./source-fetcher/index.js";
 import { createLogger } from "./logger.js";
 import { parseGenerationLlmContext } from "./llm-context.js";
@@ -50,12 +52,6 @@ export interface KnowledgeModuleConfig {
   codeWorker?: CodeGraphWorker;
 }
 
-export interface CodeGraphInstancePool {
-  get(codeGraphId: string): CodeGraphInstance | undefined;
-  set(codeGraphId: string, instance: CodeGraphInstance): void;
-  delete(codeGraphId: string): void;
-  loadIfMissing?(codeGraphId: string, dir: string): Promise<CodeGraphInstance | undefined>;
-}
 
 export interface KnowledgeModule {
   wikiService: WikiService;
@@ -90,25 +86,7 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
   const resolveLlm = (serviceId: string): LlmConfig =>
     resolveLlmConfig(serviceId, llmBindingStore.get(serviceId), llmConfig);
 
-  // Instance pool (code-graph) — lazy loading
-  const _poolMap = new Map<string, CodeGraphInstance>();
-  const instancePool: CodeGraphInstancePool = {
-    get(id: string) { return _poolMap.get(id); },
-    set(id: string, inst: CodeGraphInstance) { _poolMap.set(id, inst); },
-    delete(id: string) { _poolMap.delete(id); },
-    async loadIfMissing(id: string, dir: string) {
-      if (_poolMap.has(id)) return _poolMap.get(id);
-      try {
-        const instance = await openIndex(dir);
-        _poolMap.set(id, instance);
-        log.info(`[code-graph] lazy-loaded instance ${id}`);
-        return instance;
-      } catch (err) {
-        log.warn(`[code-graph] lazy-load failed ${id}: ${err instanceof Error ? err.message : String(err)}`);
-        return undefined;
-      }
-    },
-  };
+  const instancePool = createCodeGraphInstancePool(openIndex, closeIndex);
 
   // Wiki engine manager
   const wikiMgr = createWikiSourceManager(join(dataDir, "_wiki_engines"));
@@ -232,6 +210,10 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
     queue: sharedQueue,
     logger: { info: log.info.bind(log), warn: log.warn.bind(log), error: log.error.bind(log) },
     callbackConfig,
+    isRuntimeBusy: (id) => {
+      const status = instancePool.status(id);
+      return status.loading || status.active_queries > 0;
+    },
     // 释放 code-graph 内存资源（008 delete 清理）：从 pool 移除并关闭索引句柄。幂等。
     releaseInstance: (codeGraphId: string) => {
       const inst = instancePool.get(codeGraphId);
@@ -246,34 +228,10 @@ export function createKnowledgeModule(config: KnowledgeModuleConfig): KnowledgeM
     log.info(`marked ${interrupted} interrupted tasks as failed`);
   }
 
-  // Background restore of synced instances (non-blocking)
+  // Code graphs retain persisted metadata and load only on allocation or query.
+  // Eager restoration would reopen handles after an explicit deallocation.
+  // Background restore of wiki instances (non-blocking)
   void (async () => {
-    // Code-graph: lazy loading, just fix stats on startup
-    try {
-      const allSynced = store.listSyncedCodeGraphs();
-      for (const row of allSynced) {
-        const dir = join(dataDir, row.service_id, row.team_id, row.code_graph_id);
-        try {
-          const instance = await openIndex(dir);
-          instancePool.set(row.code_graph_id, instance);
-          const rawStats = getStats(instance);
-          if (rawStats) {
-            const statsJson = JSON.stringify({
-              files: rawStats.fileCount ?? rawStats.files ?? 0,
-              nodes: rawStats.nodeCount ?? rawStats.nodes ?? 0,
-              edges: rawStats.edgeCount ?? rawStats.edges ?? 0,
-            });
-            store.updateCodeGraphStatus(row.service_id, row.code_graph_id, { stats_json: statsJson });
-          }
-          log.info(`[code-graph] restored ${row.code_graph_id}`);
-        } catch (err) {
-          log.warn(`[code-graph] failed to restore ${row.code_graph_id}: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      }
-      log.info(`[code-graph] ${allSynced.length} synced instances restored`);
-    } catch (err) {
-      log.warn(`[code-graph] restore scan failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
     // Wiki: register to engine manager
     try {
       const allSyncedWikis = store.listSyncedWikis();

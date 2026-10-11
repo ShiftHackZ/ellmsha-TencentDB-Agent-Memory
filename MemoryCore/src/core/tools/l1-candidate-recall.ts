@@ -38,6 +38,8 @@ export interface RecallL1CandidatesParams {
 export interface RecallL1CandidatesResult {
   hits: L1SearchResult[];
   strategy: L1RecallStrategy;
+  /** Sanitized failed search branches; a partial fallback is not an empty corpus. */
+  failedPaths?: string[];
 }
 
 export async function recallL1Candidates(
@@ -74,8 +76,9 @@ export async function recallL1Candidates(
     return { hits: [], strategy: "none" };
   }
 
+  const failedPaths: string[] = [];
   const [ftsHits, vecHits] = await Promise.all([
-    recallFts(query, topK, vectorStore, hasFts, filter, logger, tag),
+    recallFts(query, topK, vectorStore, hasFts, filter, logger, tag, () => failedPaths.push("fts")),
     recallVector(
       query,
       topK,
@@ -86,6 +89,7 @@ export async function recallL1Candidates(
       embeddingTimeoutMs,
       logger,
       tag,
+      () => failedPaths.push("embedding"),
     ),
   ]);
 
@@ -100,7 +104,7 @@ export async function recallL1Candidates(
     strategy = "fts";
   } else {
     logger?.debug?.(`${tag} Both search paths returned 0 results`);
-    return { hits: [], strategy: hasEmbedding ? "embedding" : "fts" };
+    return { hits: [], strategy: hasEmbedding ? "embedding" : "fts", ...(failedPaths.length ? { failedPaths } : {}) };
   }
 
   if (strategy === "hybrid") {
@@ -108,10 +112,10 @@ export async function recallL1Candidates(
     logger?.debug?.(
       `${tag} [hybrid] RRF merged: fts=${ftsHits.length}, vec=${vecHits.length} → ${merged.length} unique`,
     );
-    return { hits: merged, strategy };
+    return { hits: merged, strategy, ...(failedPaths.length ? { failedPaths } : {}) };
   }
 
-  return { hits: ftsOk ? ftsHits : vecHits, strategy };
+  return { hits: ftsOk ? ftsHits : vecHits, strategy, ...(failedPaths.length ? { failedPaths } : {}) };
 }
 
 function hasNativeL1Hybrid(store: IMemoryStore): boolean {
@@ -183,6 +187,7 @@ async function recallFts(
   filter: IsolationFilter | undefined,
   logger: Logger | undefined,
   tag: string,
+  onFailure: () => void,
 ): Promise<L1SearchResult[]> {
   if (!hasFts) return [];
   try {
@@ -198,6 +203,7 @@ async function recallFts(
     logger?.debug?.(`${tag} [hybrid-fts] FTS5 returned ${ftsResults.length} candidates`);
     return ftsResults.map(toL1Hit);
   } catch (err) {
+    onFailure();
     logger?.warn?.(
       `${tag} [hybrid-fts] FTS5 search failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
     );
@@ -215,6 +221,7 @@ async function recallVector(
   embeddingTimeoutMs: number | undefined,
   logger: Logger | undefined,
   tag: string,
+  onFailure: () => void,
 ): Promise<L1SearchResult[]> {
   if (!hasClientEmbedding(embeddingService) && !(queryEmbedding && queryEmbedding.length > 0)) {
     return [];
@@ -228,6 +235,7 @@ async function recallVector(
         : await embeddingService!.embed(query);
     }
     if (!vec || vec.length === 0) {
+      onFailure();
       logger?.debug?.(`${tag} [hybrid-vec] Empty query embedding, skipping vector path`);
       return [];
     }
@@ -240,6 +248,7 @@ async function recallVector(
     logger?.debug?.(`${tag} [hybrid-vec] Vector search returned ${vecResults.length} candidates`);
     return vecResults.map(toL1Hit);
   } catch (err) {
+    onFailure();
     logger?.warn?.(
       `${tag} [hybrid-vec] Embedding search failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
     );

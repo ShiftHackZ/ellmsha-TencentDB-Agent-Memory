@@ -241,6 +241,30 @@ export function createCodeGraphRoutes(deps: CodeGraphRouteDeps): Hono {
     return c.json(wrapOk(toCodeGraphDetail(row)));
   });
 
+  // Runtime lifecycle is non-destructive and authenticated by the write-route middleware.
+  app.post("/runtime", async (c) => {
+    const body = await c.req.json<Record<string, unknown>>();
+    const identity = extractIdFields(c.req.header("x-tdai-service-id"), body);
+    const id = body.code_graph_id;
+    const action = body.action;
+    if (!identity || !isValidIdSegment(id) || typeof action !== "string" || !["status", "allocate", "deallocate"].includes(action))
+      return c.json(wrapError(400, "Valid service/team, code_graph_id and runtime action are required"), 400);
+    const row = cgService.getById(identity.service_id, id);
+    if (!row || row.team_id !== identity.team_id) return c.json(wrapError(404, "code graph not found"), 404);
+    if (action !== "status") {
+      if (row.status === "pending" || row.status === "processing")
+        return c.json(wrapError(409, "Code graph is busy indexing; retry after completion"), 409);
+      if (action === "allocate") {
+        if (row.status !== "ready") return c.json(wrapError(409, "Code graph must be ready before allocation"), 409);
+        const instance = await instancePool.loadIfMissing(id, cgService.dirFor(identity.service_id, row.team_id, id));
+        if (!instance) return c.json(wrapError(503, "Code graph could not be loaded"), 503);
+      } else if (!instancePool.deallocate(id)) {
+        return c.json(wrapError(409, "Code graph is busy loading or serving a query; retry later"), 409);
+      }
+    }
+    return c.json(wrapOk({ code_graph_id: id, index_status: row.status, ...instancePool.status(id) }));
+  });
+
   app.post("/update-meta", async (c) => {
     const body = await c.req.json<Record<string, unknown>>();
     const serviceId = c.req.header("x-tdai-service-id");
@@ -335,15 +359,6 @@ export function createCodeGraphRoutes(deps: CodeGraphRouteDeps): Hono {
         return c.json(wrapOk({ text: "", isError: false }));
       }
 
-      let instance = instancePool.get(cgId);
-      if (!instance && instancePool.loadIfMissing) {
-        const dir = cgService.dirFor(serviceId, row.team_id, cgId);
-        instance = await instancePool.loadIfMissing(cgId, dir);
-      }
-      if (!instance) {
-        return c.json(wrapError(503, "code graph instance not loaded"), 503);
-      }
-
       const built = buildToolParams(action, body);
       if ("error" in built) {
         return c.json(wrapError(400, built.error), 400);
@@ -353,7 +368,11 @@ export function createCodeGraphRoutes(deps: CodeGraphRouteDeps): Hono {
       if (!toolName) {
         return c.json(wrapError(403, `unknown tool: ${action}`), 403);
       }
-      const result = await executeCodeTool(instance, toolName, built.params);
+      const result = await instancePool.withInstance(
+        cgId, cgService.dirFor(serviceId, row.team_id, cgId),
+        instance => executeCodeTool(instance, toolName, built.params),
+      );
+      if (!result) return c.json(wrapError(503, "code graph instance not loaded"), 503);
       return c.json(wrapOk(result), result.isError ? 500 : 200);
     });
   }

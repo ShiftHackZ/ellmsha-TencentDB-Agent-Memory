@@ -44,7 +44,6 @@ export {
   conversationSearchRequestSchema,
   conversationSearchHitSchema,
   conversationSearchDataSchema,
-  atomicSearchRequestSchema,
   atomicSearchHitSchema,
   atomicSearchDataSchema,
 } from "./generated/schemas.js";
@@ -67,7 +66,6 @@ export type {
   CoreWriteRequest,
   ConversationSearchRequest,
   ConversationSearchData,
-  AtomicSearchRequest,
 } from "./generated/types.js";
 
 // Import schemas we need to override
@@ -163,14 +161,62 @@ export interface AtomicQueryData {
   total: number;
 }
 
+export const atomicSearchRequestSchema = z.object({
+  query: z.string().min(1).max(8192),
+  limit: z.number().int().min(1).max(100).default(5),
+  offset: z.number().int().min(0).max(10_000).default(0),
+  type: z.string().optional(),
+  time_start: z.string().optional(),
+  time_end: z.string().optional(),
+  intent: z.enum(["search", "continue", "latest", "current_decision", "exact_ids", "list_all", "rules"]).default("search"),
+  scope_mode: z.enum(["current_project", "cross_project", "projectless"]).default("projectless"),
+  project_scopes: z.array(z.string().min(3).max(160)).max(64).default([]),
+  project_aliases: z.array(z.string().min(2).max(160)).max(64).default([]),
+  include_global: z.boolean().default(false),
+  exact_ids: z.array(z.string().min(2).max(64)).max(32).default([]),
+  team_id: z.string().optional(),
+  user_id: z.string().optional(),
+  agent_id: z.string().optional(),
+  task_id: z.string().optional(),
+});
+export type AtomicSearchRequest = z.infer<typeof atomicSearchRequestSchema>;
+
 export type AtomicSearchHit = AtomicDetail & {
   score: number;
   /** Relative scenario path for reading the full source, when known. */
   source_path?: string;
+  /** Date parsed from the source body/path, never the import/write timestamp. */
+  event_date?: string;
+  /** Evidence-state hint parsed from source content. */
+  status_hint?: string;
 };
 
 export interface AtomicSearchData {
+  /** Retrieval path actually used; census coverage is independent of match count. */
+  strategy: string;
+  /** True if a backend/candidate bound prevents exhaustive evidence. */
+  degraded: boolean;
+  /** Sanitized explanation of incomplete/degraded retrieval. */
+  message?: string;
+  /** Available evidence is not a guarantee that a factual answer is complete. */
+  evidence_status: "available" | "partial" | "empty" | "missing_exact_ids" | "degraded";
   items: AtomicSearchHit[];
+  returned: number;
+  total_candidates: number;
+  complete: boolean;
+  next_offset?: number;
+  matched_exact_ids: string[];
+  missing_exact_ids: string[];
+  source_catalog?: {
+    paths: string[];
+    returned: number;
+    total: number;
+    complete: boolean;
+    next_offset?: number;
+    error?: string;
+    /** Catalogue entries lacking an indexed L1 record; may be intentionally historical. */
+    unindexed_paths?: string[];
+  };
 }
 
 export interface ScenarioEntry extends Omit<GeneratedScenarioEntry, "version"> {

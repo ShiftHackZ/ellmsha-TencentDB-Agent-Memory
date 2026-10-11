@@ -1894,7 +1894,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
 
   async queryL1Paginated(filter: L1PaginatedFilter): Promise<L1PaginatedResult> {
     await this._ensureInit();
-    if (this.degraded) return { rows: [], total: 0 };
+    if (this.degraded) return { rows: [], total: 0, error: "store_degraded" };
 
     try {
       const conditions: string[] = [];
@@ -1956,7 +1956,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
       return { rows, total };
     } catch (err) {
       this.logger?.warn(`${TAG} [L1-queryPaginated] FAILED: ${err instanceof Error ? err.message : String(err)}`);
-      return { rows: [], total: 0 };
+      return { rows: [], total: 0, error: "query_failed" };
     }
   }
 

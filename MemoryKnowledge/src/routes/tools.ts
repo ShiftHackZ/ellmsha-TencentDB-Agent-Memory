@@ -428,15 +428,10 @@ async function executeCodeGraphTool(
     toolParams[k] = v;
   }
 
-  let instance = instancePool.get(code_graph_id);
-  if (!instance && instancePool.loadIfMissing) {
-    const dir = cgService.dirFor(serviceId, team_id, code_graph_id);
-    instance = await instancePool.loadIfMissing(code_graph_id, dir);
-  }
-  if (!instance) {
-    return Response.json(wrapError(503, "code graph instance not loaded"), { status: 503 });
-  }
-
-  const result = await executeCodeTool(instance, cgToolName, toolParams);
+  const result = await instancePool.withInstance(
+    code_graph_id, cgService.dirFor(serviceId, team_id, code_graph_id),
+    instance => executeCodeTool(instance, cgToolName, toolParams),
+  );
+  if (!result) return Response.json(wrapError(503, "code graph instance not loaded"), { status: 503 });
   return Response.json(wrapOk(result), { status: result.isError ? 500 : 200 });
 }

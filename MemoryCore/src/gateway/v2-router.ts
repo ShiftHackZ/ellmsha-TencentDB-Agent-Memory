@@ -25,7 +25,7 @@ import { StoragePaths, type IStorageBackend, type ListEntry } from "../core/stor
 import type { Logger } from "../core/types.js";
 import type { IStateBackend } from "../core/state/types.js";
 import type { PipelineWorker } from "../services/pipeline-worker.js";
-import { executeMemorySearch } from "../core/tools/memory-search.js";
+import { executeMemorySearch, paginateSourceCatalog } from "../core/tools/memory-search.js";
 import { executeConversationSearch } from "../core/tools/conversation-search.js";
 import { indexScenarioMemory, scenarioMemoryId } from "./scenario-memory-index.js";
 import type { MemoryRecord } from "../core/record/l1-writer.js";
@@ -1209,7 +1209,9 @@ async function handleAtomicCount(body: unknown, _auth: V2AuthContext, requestId:
 async function handleAtomicSearch(body: unknown, auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
   const parsed = atomicSearchRequestSchema.safeParse(body);
   if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
-  const { query, type } = parsed.data;
+  const {
+    query, type, offset, intent, scope_mode, project_scopes, project_aliases, include_global, exact_ids,
+  } = parsed.data;
   const limit = parsed.data.limit ?? 5;
 
   const tStart = performance.now();
@@ -1225,7 +1227,12 @@ async function handleAtomicSearch(body: unknown, auth: V2AuthContext, requestId:
     // 不传 sessionId：L1 召回应跨 session（agent 维度）
   } : undefined;
   const result = await executeMemorySearch({
-    query, limit, type,
+    query, limit, type, offset, intent,
+    scopeMode: scope_mode,
+    projectScopes: project_scopes,
+    projectAliases: project_aliases,
+    includeGlobal: include_global,
+    exactIds: exact_ids,
     filter: searchFilter,
     vectorStore: deps.getStore(),
     embeddingService: deps.getEmbedding(),
@@ -1291,9 +1298,60 @@ async function handleAtomicSearch(body: unknown, auth: V2AuthContext, requestId:
     agent_id: r.agent_id,
     task_id: r.task_id,
     created_at: r.created_at, updated_at: r.updated_at, score: r.score,
+    event_date: r.event_date,
+    status_hint: r.status_hint,
   }));
 
-  return successEnvelope<AtomicSearchData>({ items }, requestId);
+  let sourceCatalog: AtomicSearchData["source_catalog"];
+  if (intent === "list_all") {
+    try {
+      const baseStorage = deps.getStorage();
+      if (!baseStorage) throw new Error("storage_unavailable");
+      const storage = scopedProfileStorage(baseStorage, deps.requestIsolation);
+      const catalog = await listBoundedScenarioObjects(storage.getBackend(), StoragePaths.sceneBlocksDir);
+      const paths = catalog.entries
+        .filter((entry) => !entry.isDirectory)
+        .map((entry) => entry.key.startsWith(StoragePaths.sceneBlocksDir)
+          ? entry.key.slice(StoragePaths.sceneBlocksDir.length)
+          : entry.key);
+      sourceCatalog = paginateSourceCatalog(paths, {
+        limit,
+        offset,
+        scopeMode: scope_mode,
+        projectScopes: project_scopes,
+        projectAliases: project_aliases,
+        includeGlobal: include_global,
+        catalogComplete: catalog.complete,
+      });
+      if (!catalog.complete) sourceCatalog.error = "catalog_bound_exhausted";
+    } catch (error) {
+      deps.logger.warn(`${TAG} [atomic/search] source catalog unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      sourceCatalog = { paths: [], returned: 0, total: 0, complete: false, error: "catalog_unavailable" };
+    }
+  }
+
+  // Semantic and alphabetical catalogue pages have different orderings. Do
+  // not compare their current pages as if they were the same cursor. The L2
+  // catalogue also includes intentionally historical/unindexed originals.
+  const representedPaths = new Set(result.indexedSourcePaths ?? items.flatMap((item) => item.source_path ? [item.source_path] : []));
+  if (sourceCatalog) sourceCatalog.unindexed_paths = sourceCatalog.paths.filter((path) => !representedPaths.has(path));
+  const complete = result.complete && (sourceCatalog?.complete ?? true);
+  const degraded = !!result.degraded || !!sourceCatalog?.error;
+
+  return successEnvelope<AtomicSearchData>({
+    strategy: result.strategy,
+    degraded,
+    message: sourceCatalog?.error ? `Source catalogue incomplete: ${sourceCatalog.error}. ${result.message ?? ""}`.trim() : result.message,
+    evidence_status: degraded ? "degraded" : result.missingExactIds.length ? "missing_exact_ids" : !complete ? "partial" : items.length ? "available" : "empty",
+    items,
+    returned: items.length,
+    total_candidates: sourceCatalog?.total ?? result.total,
+    complete,
+    next_offset: sourceCatalog?.next_offset ?? result.nextOffset,
+    matched_exact_ids: result.matchedExactIds,
+    missing_exact_ids: result.missingExactIds,
+    source_catalog: sourceCatalog,
+  }, requestId);
 }
 
 async function handleAtomicDelete(body: unknown, auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
@@ -1789,6 +1847,28 @@ async function listAllScenarioObjects(backend: IStorageBackend, prefix: string):
     marker = page.nextMarker;
   } while (marker);
   return entries;
+}
+
+async function listBoundedScenarioObjects(
+  backend: IStorageBackend,
+  prefix: string,
+  maxEntries = 4096,
+): Promise<{ entries: ListEntry[]; complete: boolean }> {
+  const entries: ListEntry[] = [];
+  let marker: string | undefined;
+  const seenMarkers = new Set<string>();
+  do {
+    const remaining = maxEntries - entries.length;
+    if (remaining <= 0) return { entries, complete: false };
+    const page = await backend.listObjects(prefix, { recursive: true, maxKeys: Math.min(1000, remaining), marker });
+    entries.push(...page.entries.slice(0, remaining));
+    if (page.entries.length > remaining) return { entries, complete: false };
+    if (!page.nextMarker) return { entries, complete: true };
+    if (seenMarkers.has(page.nextMarker)) return { entries, complete: false };
+    seenMarkers.add(page.nextMarker);
+    marker = page.nextMarker;
+  } while (marker);
+  return { entries, complete: true };
 }
 
 async function handleScenarioLs(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {

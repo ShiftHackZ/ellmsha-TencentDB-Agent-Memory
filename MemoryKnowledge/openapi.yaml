@@ -522,11 +522,52 @@ paths:
         default:
           $ref: '#/components/responses/ErrorResponse'
 
+  /code-graph/runtime:
+    post:
+      tags: [Code-Graph]
+      summary: Inspect or manage a live code graph handle
+      description: >-
+        Requires service authentication and matching team ownership. Allocation opens an existing ready
+        snapshot. Deallocation closes an idle runtime handle only; graph metadata, snapshot files,
+        and user code are preserved. Queries automatically reload a released handle.
+      operationId: manageCodeGraphRuntime
+      parameters:
+        - $ref: '#/components/parameters/ServiceIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CodeGraphRuntimeRequest'
+      responses:
+        '200':
+          description: Current runtime state after the requested operation
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponseEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/CodeGraphRuntimeState'
+        '400':
+          description: Malformed identity, graph ID, or unsupported action
+        '404':
+          description: Graph absent from the requested service and team
+        '409':
+          description: Graph is indexing, loading, in use by a query, or not ready for allocation
+        '503':
+          description: The existing index snapshot could not be opened
+        default:
+          $ref: '#/components/responses/ErrorResponse'
+
   /code-graph/sync:
     post:
       tags: [Code-Graph]
       summary: Re-sync (git fetch + re-index)
       operationId: syncCodeGraph
+      description: Rebuild is rejected while the graph is already indexing, loading, or serving a live query.
       requestBody:
         required: true
         content:
@@ -538,6 +579,33 @@ paths:
           description: Accepted
         '404':
           description: Code graph not found
+        '409':
+          description: Index or runtime is busy; retry after the active operation finishes.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, message, data]
+                properties:
+                  code:
+                    type: integer
+                    enum: [409]
+                    description: Conflict status code.
+                  message:
+                    type: string
+                    description: Human-readable conflict summary.
+                  data:
+                    type: object
+                    required: [status, step]
+                    properties:
+                      status:
+                        type: string
+                        enum: [pending, processing, ready, failed]
+                        description: Current persisted index state; ready can still have live runtime work.
+                      step:
+                        type: string
+                        nullable: true
+                        description: Current indexing phase, or runtime_busy while loading or querying.
         default:
           $ref: '#/components/responses/ErrorResponse'
 
@@ -1128,6 +1196,51 @@ components:
       properties:
         code_graph_id:
           type: string
+
+    CodeGraphRuntimeRequest:
+      type: object
+      required: [team_id, code_graph_id, action]
+      properties:
+        team_id:
+          type: string
+          pattern: '^[A-Za-z0-9_-]+$'
+          maxLength: 200
+          description: Owning team; a mismatched team receives not found
+        code_graph_id:
+          type: string
+          pattern: '^[A-Za-z0-9_-]+$'
+          maxLength: 200
+          description: Existing graph identifier from the project catalog
+        action:
+          type: string
+          enum: [status, allocate, deallocate]
+          description: Inspect state, open a ready snapshot, or close only its idle runtime handle
+        user_id:
+          type: string
+          description: Optional requesting user identity, forwarded by the scoped desktop adapter
+        agent_id:
+          type: string
+          description: Optional requesting agent identity, forwarded by the scoped desktop adapter
+    CodeGraphRuntimeState:
+      type: object
+      required: [code_graph_id, index_status, loaded, loading, active_queries]
+      properties:
+        code_graph_id:
+          type: string
+          description: Unchanged graph identifier
+        index_status:
+          type: string
+          description: Persistent index build status; deallocation does not change it
+        loaded:
+          type: boolean
+          description: Whether a live index handle is currently held in memory
+        loading:
+          type: boolean
+          description: Whether an existing snapshot is currently being opened
+        active_queries:
+          type: integer
+          minimum: 0
+          description: Number of queries holding or loading the handle; nonzero prevents deallocation
 
     CodeGraphSyncRequest:
       type: object

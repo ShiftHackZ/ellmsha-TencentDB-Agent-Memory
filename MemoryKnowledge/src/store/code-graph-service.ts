@@ -52,12 +52,12 @@ export type CodeGraphWorker = (ctx: CodeGraphBuildContext) => Promise<CodeGraphB
  * sync 结果（判别联合）：
  *   - ok       已入队重建；
  *   - not_found memory/team/id 不匹配；
- *   - busy     正在 pending/processing（并发拒绝，对应 HTTP 409），step 为内部阶段（可 null）。
+ *   - busy     indexing or live runtime use prevents a rebuild (HTTP 409).
  */
 export type SyncResult =
   | { kind: "ok"; row: CodeGraphRow }
   | { kind: "not_found" }
-  | { kind: "busy"; status: "pending" | "processing"; step: string | null };
+  | { kind: "busy"; status: CodeGraphRow["status"]; step: string | null };
 
 export interface CodeGraphServiceLogger {
   info?: (msg: string) => void;
@@ -80,6 +80,8 @@ export interface CodeGraphServiceOptions {
    * 由 module.ts 装配时提供（封装 instancePool.delete + closeIndex）。
    */
   releaseInstance?: (codeGraphId: string) => void;
+  /** Loading or active queries must finish before any manual/automatic rebuild. */
+  isRuntimeBusy?: (codeGraphId: string) => boolean;
 }
 
 export interface CreateCodeGraphParams {
@@ -103,6 +105,7 @@ export class CodeGraphService {
   private readonly logger?: CodeGraphServiceLogger;
   private readonly callbackConfig?: { tmcCallbackUrl: string };
   private readonly releaseInstance?: (codeGraphId: string) => void;
+  private readonly isRuntimeBusy?: (codeGraphId: string) => boolean;
   /**
    * In-flight delete 标记：delete 命中一个正在排队/执行的资源时置位，
    * worker 在检查点读取以决定中止。仅内存态（同 id 由 SerialQueue 串行 +
@@ -118,6 +121,7 @@ export class CodeGraphService {
     this.logger = opts.logger;
     this.callbackConfig = opts.callbackConfig;
     this.releaseInstance = opts.releaseInstance;
+    this.isRuntimeBusy = opts.isRuntimeBusy;
   }
 
   dirFor(serviceId: string, teamId: string, codeGraphId: string): string {
@@ -156,6 +160,9 @@ export class CodeGraphService {
     // 并发拒绝：正在排队/执行中直接拒绝，不覆盖状态、不重复入队、不写 audit。
     if (row.status === "pending" || row.status === "processing") {
       return { kind: "busy", status: row.status, step: row.internal_status };
+    }
+    if (this.isRuntimeBusy?.(codeGraphId)) {
+      return { kind: "busy", status: row.status, step: "runtime_busy" };
     }
     const nextVersion = row.version + 1;
     this.store.updateCodeGraphStatus(serviceId, codeGraphId, {
