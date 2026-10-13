@@ -189,6 +189,16 @@ export type AtomicSearchHit = AtomicDetail & {
   event_date?: string;
   /** Evidence-state hint parsed from source content. */
   status_hint?: string;
+  /** Stored lifecycle; absent means unknown, not an active user instruction. */
+  source_status?: string;
+  /** Storage operation/import provenance; does not authenticate user authorship. */
+  source_origin?: "scenario_write" | "v2_import";
+  /** Original imported source digest, when retained by migration. */
+  source_sha256?: string;
+  /** Applicable guidance scope after project isolation and relevance filtering. */
+  guidance_scope?: "project" | "global";
+  /** Active comes from stored lifecycle, never an imperative sentence in content. */
+  guidance_status?: "active" | "unverified";
 };
 
 export interface AtomicSearchData {

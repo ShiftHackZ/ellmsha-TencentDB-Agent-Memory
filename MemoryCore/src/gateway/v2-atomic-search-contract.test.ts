@@ -20,20 +20,22 @@ const auth = { serviceId: "service", apiKey: "local" } as never;
 
 function searchResult(sourcePath = "knowledge/project-scope/task-2.md") {
   return {
-    results: [{
-      id: "memory-1",
-      content: "fixture evidence",
-      type: "episodic",
-      priority: 70,
-      scene_name: "fixture",
-      score: 0.9,
-      version: 1,
-      created_at: "2026-10-11T00:00:00.000Z",
-      updated_at: "2026-10-11T00:00:00.000Z",
-      source_path: sourcePath,
-      event_date: "2026-10-11",
-      status_hint: "accepted",
-    }],
+    results: [
+      {
+        id: "memory-1",
+        content: "fixture evidence",
+        type: "episodic",
+        priority: 70,
+        scene_name: "fixture",
+        score: 0.9,
+        version: 1,
+        created_at: "2026-10-11T00:00:00.000Z",
+        updated_at: "2026-10-11T00:00:00.000Z",
+        source_path: sourcePath,
+        event_date: "2026-10-11",
+        status_hint: "accepted",
+      },
+    ],
     total: 1,
     complete: true,
     matchedExactIds: ["DEMO-4510"],
@@ -71,17 +73,19 @@ describe("atomic/search gateway compatibility", () => {
 
     const response = await handleAtomicSearch({ query: "legacy query" }, auth, "request-1", dependencies());
     expect(response.code).toBe(0);
-    expect(executeMemorySearch).toHaveBeenCalledWith(expect.objectContaining({
-      query: "legacy query",
-      limit: 5,
-      offset: 0,
-      intent: "search",
-      scopeMode: "projectless",
-      projectScopes: [],
-      projectAliases: [],
-      includeGlobal: false,
-      exactIds: [],
-    }));
+    expect(executeMemorySearch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        query: "legacy query",
+        limit: 5,
+        offset: 0,
+        intent: "search",
+        scopeMode: "projectless",
+        projectScopes: [],
+        projectAliases: [],
+        includeGlobal: false,
+        exactIds: [],
+      })
+    );
     expect(response.data).toMatchObject({
       returned: 1,
       total_candidates: 1,
@@ -89,6 +93,14 @@ describe("atomic/search gateway compatibility", () => {
       matched_exact_ids: ["DEMO-4510"],
       missing_exact_ids: [],
     });
+  });
+
+  it("preserves active rule storage provenance in the public response", async () => {
+    const fixture = searchResult();
+    const provenance = { source_status: "active", source_origin: "v2_import", source_sha256: "a".repeat(64), guidance_scope: "project", guidance_status: "active" };
+    executeMemorySearch.mockResolvedValue({ ...fixture, results: [{ ...fixture.results[0], ...provenance, type: "instruction" }] });
+    const response = await handleAtomicSearch({ query: "fixture", intent: "rules" }, auth, "rules", dependencies());
+    expect(response.data?.items[0]).toMatchObject(provenance);
   });
 
   it("forwards scoped planning and returns paginated source catalog metadata", async () => {
@@ -120,16 +132,18 @@ describe("atomic/search gateway compatibility", () => {
     expect(atomicSearchRequestSchema.parse(request)).toEqual(expect.objectContaining(request));
 
     const response = await handleAtomicSearch(request, auth, "request-2", dependencies(storage));
-    expect(executeMemorySearch).toHaveBeenCalledWith(expect.objectContaining({
-      limit: 2,
-      offset: 2,
-      intent: "list_all",
-      scopeMode: "current_project",
-      projectScopes: ["project-scope"],
-      projectAliases: ["Fixture Project"],
-      includeGlobal: true,
-      exactIds: ["DEMO-4510"],
-    }));
+    expect(executeMemorySearch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        limit: 2,
+        offset: 2,
+        intent: "list_all",
+        scopeMode: "current_project",
+        projectScopes: ["project-scope"],
+        projectAliases: ["Fixture Project"],
+        includeGlobal: true,
+        exactIds: ["DEMO-4510"],
+      })
+    );
     expect(response.data).toMatchObject({
       returned: 1,
       total_candidates: 6,
@@ -148,10 +162,14 @@ describe("atomic/search gateway compatibility", () => {
   });
   it("keeps corpus coverage independent of alphabetical catalogue page order", async () => {
     executeMemorySearch.mockResolvedValue({ ...searchResult("knowledge/project-scope/a.md"), indexedSourcePaths: ["knowledge/project-scope/a.md", "knowledge/project-scope/z.md"] });
-    const backend = { listObjects: vi.fn().mockResolvedValue({ entries: [
-      { key: "scene_blocks/knowledge/project-scope/a.md", isDirectory: false },
-      { key: "scene_blocks/knowledge/project-scope/z.md", isDirectory: false },
-    ] }) };
+    const backend = {
+      listObjects: vi.fn().mockResolvedValue({
+        entries: [
+          { key: "scene_blocks/knowledge/project-scope/a.md", isDirectory: false },
+          { key: "scene_blocks/knowledge/project-scope/z.md", isDirectory: false },
+        ],
+      }),
+    };
     const response = await handleAtomicSearch({ query: "all tasks", intent: "list_all", limit: 1, offset: 1 }, auth, "order", dependencies(new StorageAdapter(backend as never)));
     expect(response.data).toMatchObject({ complete: true, degraded: false, source_catalog: { paths: ["knowledge/project-scope/z.md"], unindexed_paths: [], complete: true } });
   });
@@ -168,5 +186,4 @@ describe("atomic/search gateway compatibility", () => {
     const response = await handleAtomicSearch({ query: "a question" }, auth, "degraded", dependencies());
     expect(response.data).toMatchObject({ returned: 1, degraded: true, evidence_status: "degraded", complete: false, message: "Candidate census unavailable" });
   });
-
 });

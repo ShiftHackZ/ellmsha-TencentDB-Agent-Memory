@@ -1300,6 +1300,11 @@ async function handleAtomicSearch(body: unknown, auth: V2AuthContext, requestId:
     created_at: r.created_at, updated_at: r.updated_at, score: r.score,
     event_date: r.event_date,
     status_hint: r.status_hint,
+    source_status: r.source_status,
+    source_origin: r.source_origin,
+    source_sha256: r.source_sha256,
+    guidance_scope: r.guidance_scope,
+    guidance_status: r.guidance_status,
   }));
 
   let sourceCatalog: AtomicSearchData["source_catalog"];

@@ -10,6 +10,7 @@
  * The tool is registered via `api.registerTool()` in index.ts.
  */
 
+import { createHash } from "node:crypto";
 import type { IMemoryStore, IsolationFilter, L1SearchResult } from "../store/types.js";
 import { hasClientEmbedding, type EmbeddingService } from "../store/embedding.js";
 import type { Logger } from "../types.js";
@@ -40,6 +41,11 @@ export interface MemorySearchResultItem {
   status_hint?: string;
   /** Original source lifecycle, distinct from inferred implementation state. */
   source_status?: string;
+  /** Storage provenance, not a claim that a user personally authored the text. */
+  source_origin?: "scenario_write" | "v2_import";
+  source_sha256?: string;
+  guidance_scope?: "project" | "global";
+  guidance_status?: "active" | "unverified";
 }
 
 export interface MemorySearchResult {
@@ -73,11 +79,29 @@ const TAG = "[memory-tdai][tdai_memory_search]";
 function toSearchItem(r: L1SearchResult): MemorySearchResultItem {
   let sourcePath: string | undefined;
   let sourceStatus: string | undefined;
+  let sourceOrigin: MemorySearchResultItem["source_origin"];
+  let sourceHash: string | undefined;
   try {
     const metadata = JSON.parse(r.metadata_json || "{}");
-    if (typeof metadata.source_path === "string") sourcePath = metadata.source_path;
-    else if (metadata.migration?.source === "ellmsha-v2-vault" && typeof metadata.migration.source_path === "string") {
+    if (typeof metadata.source_path === "string") {
+      sourcePath = metadata.source_path;
+      if (metadata.source_origin === "scenario_write") sourceOrigin = "scenario_write";
+      if (typeof metadata.source_status === "string") sourceStatus = metadata.source_status;
+      // Earlier explicit scenario writes had only source_path. Verify their
+      // stable owner/path identity and reserved session, rather than requiring
+      // new metadata or treating arbitrary historical prose as active guidance.
+      const scenarioId = `scenario-${createHash("sha256")
+        .update(JSON.stringify([r.team_id ?? "", r.user_id ?? "", r.agent_id ?? "", sourcePath]))
+        .digest("hex")
+        .slice(0, 40)}`;
+      if (r.record_id === scenarioId && r.session_key === "ellmsha-durable-memory") {
+        sourceOrigin = "scenario_write";
+        if (!sourceStatus && (r.type === "instruction" || r.type === "persona")) sourceStatus = "active";
+      }
+    } else if (metadata.migration?.source === "ellmsha-v2-vault" && typeof metadata.migration.source_path === "string") {
       sourcePath = `v2/${metadata.migration.source_path}`;
+      sourceOrigin = "v2_import";
+      if (typeof metadata.migration.source_sha256 === "string" && /^[a-f0-9]{64}$/.test(metadata.migration.source_sha256)) sourceHash = metadata.migration.source_sha256;
       if (typeof metadata.migration.status === "string") sourceStatus = metadata.migration.status;
     }
   } catch {
@@ -99,6 +123,8 @@ function toSearchItem(r: L1SearchResult): MemorySearchResultItem {
     updated_at: r.timestamp_end,
     source_path: sourcePath,
     source_status: sourceStatus,
+    source_origin: sourceOrigin,
+    source_sha256: sourceHash,
   };
 }
 
@@ -314,19 +340,96 @@ export function applyRetrievalPlan(
 }
 
 /** Fuse lexical relevance inside the selected project with the semantic recall. */
-function rankScopedCandidates(items: MemorySearchResultItem[], recalled: L1SearchResult[], query: string): MemorySearchResultItem[] {
-  const tokens = extractQueryTokens(query.replace(/^applicable stable rules and decisions for:\s*/i, ""));
+function rankScopedCandidates(items: MemorySearchResultItem[], recalled: L1SearchResult[], query: string, rules = false): MemorySearchResultItem[] {
+  const cleanQuery = query.replace(/^applicable stable rules and decisions for:\s*/i, "");
+  // Weight explicit questions over surrounding execution/QA boilerplate without
+  // discarding the task in an earlier sentence ("Prepare X. Which rules apply?").
+  // This only ranks candidates; it never changes the fact query, ID or authority.
+  const questions = rules ? cleanQuery.match(/[^.!?\n]+\?/g) : undefined;
+  const questionTokens = new Set(extractQueryTokens(questions?.join(" ") ?? "").filter((token) => !GUIDANCE_GENERIC_TOKENS.has(token)));
+  const tokens = extractQueryTokens(cleanQuery).filter((token) => !rules || !GUIDANCE_GENERIC_TOKENS.has(token));
   const documents = items.map((item) => new Set(extractQueryTokens(`${item.source_path ?? ""} ${item.content}`)));
-  const weights = tokens.map((token) => Math.log(1 + items.length / (1 + documents.filter((doc) => doc.has(token)).length)));
-  const lexical = items.map((item, index) => ({ item, value: tokens.reduce((sum, token, t) => sum + (documents[index].has(token) ? weights[t] : 0), 0) }))
-    .filter((entry) => entry.value > 0).sort((a, b) => b.value - a.value || a.item.id.localeCompare(b.item.id));
+  const weights = tokens.map((token) => Math.log(1 + items.length / (1 + documents.filter((doc) => doc.has(token)).length)) * (questionTokens.has(token) ? 3 : 1));
+  const averageLength = documents.reduce((sum, doc) => sum + doc.size, 0) / Math.max(items.length, 1) || 1;
+  const lexical = items
+    .map((item, index) => {
+      const body = tokens.reduce((sum, token, t) => sum + (documents[index].has(token) ? weights[t] : 0), 0);
+      // Guidance has a subject: long backlogs/status instructions must not win
+      // every small rule page merely by mentioning more words in the user prompt.
+      // Apply BM25-style length normalization and a subject boost only to rules;
+      // ordinary fact/semantic ranking remains unchanged.
+      const subject = rules ? new Set(extractQueryTokens(`${item.source_path?.split("/").at(-1) ?? ""} ${item.content.split("\n", 1)[0]}`)) : new Set<string>();
+      const topical = tokens.reduce((sum, token, t) => sum + (subject.has(token) ? weights[t] : 0), 0);
+      const value = rules ? (body * 2.2) / (1 + 1.2 * (0.25 + (0.75 * documents[index].size) / averageLength)) + 2 * topical : body;
+      return { item, value };
+    })
+    .filter((entry) => entry.value > 0)
+    .sort((a, b) => b.value - a.value || a.item.id.localeCompare(b.item.id));
   const lexicalRanks = new Map(lexical.map((entry, index) => [entry.item.id, index]));
   const ids = new Set(items.map((item) => item.id));
   const semanticRanks = new Map(recalled.filter((hit) => ids.has(hit.record_id)).map((hit, index) => [hit.record_id, index]));
-  return items.map((item) => ({ ...item, score:
-    (lexicalRanks.has(item.id) ? 1 / (60 + lexicalRanks.get(item.id)!) : 0) +
-    (semanticRanks.has(item.id) ? 1 / (60 + semanticRanks.get(item.id)!) : 0),
-  })).sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
+  return items
+    .map((item) => {
+      const lexicalScore = lexicalRanks.has(item.id) ? 1 / (60 + lexicalRanks.get(item.id)!) : 0;
+      const semanticScore = semanticRanks.has(item.id) ? 1 / (60 + semanticRanks.get(item.id)!) : 0;
+      // Best-rank fusion lets either channel nominate a rule. A semantic-only
+      // cross-language match must not lose to incidental lexical overlap, nor
+      // must long records matching both channels crowd out a precise rule subject.
+      return { ...item, score: rules ? Math.max(lexicalScore, semanticScore) : lexicalScore + semanticScore };
+    })
+    .sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
+}
+
+/** Lifecycle/scope come from storage, never from "User says" inside a search hit. */
+const GUIDANCE_GENERIC_TOKENS = new Set([
+  "project",
+  "task",
+  "user",
+  "goal",
+  "current",
+  "fix",
+  "bug",
+  "work",
+  "applicable",
+  "stable",
+  "rule",
+  "rules",
+  "guidance",
+  "policy",
+  "policies",
+  "apply",
+  "follow",
+  "prepare",
+  "next",
+  "latest",
+  "against",
+  "decisions",
+  "проект",
+  "задача",
+]);
+function applicableGuidance(items: MemorySearchResultItem[], query: string): MemorySearchResultItem[] {
+  const tokens = new Set(extractQueryTokens(query.replace(/^applicable stable rules and decisions for:\s*/i, "")).filter((token) => !GUIDANCE_GENERIC_TOKENS.has(token)));
+  const relevant = (item: MemorySearchResultItem) => extractQueryTokens(item.content).some((token) => tokens.has(token));
+  return items.flatMap((item) => {
+    if (item.type !== "instruction" && item.type !== "persona") return [];
+    if (/^(archived|superseded|obsolete|inactive|draft|unverified)$/i.test(item.source_status ?? "") || statusHint(item.content) === "superseded") return [];
+    const global = isGlobalSource(item.source_path ?? "");
+    const active = item.source_status === "active";
+    // Canonical global rules (the importer assigns priority 90 to rules/guidance)
+    // apply across tasks. Personal facts and project-alias notes need relevance.
+    const globalRule = global && active && item.type === "instruction" && (item.source_origin === "scenario_write" || item.priority >= 90);
+    if (global && !globalRule && !relevant(item)) return [];
+    if (!global && !active && item.score <= 0) return [];
+    return [
+      {
+        ...item,
+        guidance_scope: global ? ("global" as const) : ("project" as const),
+        guidance_status: active ? ("active" as const) : ("unverified" as const),
+        // Project active rules cannot lose every slot to semantically similar global notes.
+        score: (active && !global ? 4 : globalRule ? 2 : 0) + item.score,
+      },
+    ];
+  });
 }
 
 // ============================
@@ -425,8 +528,13 @@ export async function executeMemorySearch(params: {
 
   const candidateK = scopeMode === "current_project" ? 256 : Math.min(Math.max((offset + limit) * 6, 48), 256);
   const recalled = await recallL1Candidates({
-    query, topK: candidateK, vectorStore, embeddingService, logger,
-    filter: isolationFilter, logTag: TAG,
+    query,
+    topK: candidateK,
+    vectorStore,
+    embeddingService,
+    logger,
+    filter: isolationFilter,
+    logTag: TAG,
   }).catch(() => ({ hits: [] as L1SearchResult[], strategy: "none" as const, failedPaths: ["semantic"] }));
 
   // A semantic top-K is not a source census. Enumerate a bounded isolated
@@ -439,13 +547,16 @@ export async function executeMemorySearch(params: {
   let candidates = recalled.hits;
   if (vectorStore.queryL1Paginated && (scopeMode === "current_project" || intent !== "search" || exactIds.length > 0)) {
     try {
-      const page = await vectorStore.queryL1Paginated({ ...isolationFilter, type: typeFilter, limit: censusLimit, offset: 0 });
-      if (page.error) throw new Error(page.error);
+      // Rule retrieval has its own bounded census: ordinary facts must not
+      // consume every slot before active project guidance is even considered.
+      const pages =
+        intent === "rules" && !typeFilter
+          ? await Promise.all((["instruction", "persona"] as const).map((type) => vectorStore.queryL1Paginated!({ ...isolationFilter, type, limit: censusLimit / 2, offset: 0 })))
+          : [await vectorStore.queryL1Paginated({ ...isolationFilter, type: typeFilter, limit: censusLimit, offset: 0 })];
+      for (const page of pages) if (page.error) throw new Error(page.error);
+      const page = { rows: pages.flatMap((page) => page.rows), total: pages.reduce((sum, page) => sum + page.total, 0) };
       const seen = new Set(page.rows.map((row) => row.record_id));
-      candidates = [
-        ...page.rows.map((row) => ({ ...row, score: 0 })),
-        ...recalled.hits.filter((hit) => !seen.has(hit.record_id)),
-      ];
+      candidates = [...page.rows.map((row) => ({ ...row, score: 0 })), ...recalled.hits.filter((hit) => !seen.has(hit.record_id))];
       candidateRecallComplete = page.rows.length >= page.total;
       if (!candidateRecallComplete) {
         degraded = true;
@@ -461,7 +572,6 @@ export async function executeMemorySearch(params: {
   if (recalled.strategy === "none" && !candidateRecallComplete) degraded = true;
   let results = candidates.map(toSearchItem);
   if (scopeMode === "current_project") results = results.filter((item) => matchesProject(item, projectScopes, projectAliases, includeGlobal));
-  if (intent === "rules") results = results.filter((item) => item.type === "instruction" || item.type === "persona");
 
   const preFilterCount = results.length;
   if (typeFilter) {
@@ -474,8 +584,8 @@ export async function executeMemorySearch(params: {
     logger?.debug?.(`${TAG} After scene filter "${sceneFilter}": ${results.length}/${preFilterCount}`);
   }
 
-  results = rankScopedCandidates(results, recalled.hits, query);
-  const indexedSourcePaths = intent === "list_all" ? [...new Set(results.flatMap((item) => item.source_path ? [item.source_path] : []))] : undefined;
+  results = rankScopedCandidates(results, recalled.hits, query, intent === "rules");
+  const indexedSourcePaths = intent === "list_all" ? [...new Set(results.flatMap((item) => (item.source_path ? [item.source_path] : [])))] : undefined;
   if (["search", "continue", "current_decision"].includes(intent) || (intent === "latest" && !/\b(task|ticket|issue)\b|задач/iu.test(query))) {
     results = results.filter((item) => item.score > 0);
   }
@@ -485,14 +595,7 @@ export async function executeMemorySearch(params: {
     const workRecords = results.filter((item) => /\b[A-Z][A-Z0-9]{1,15}-\d{2,}\b/i.test(`${item.source_path?.split("/").at(-1) ?? ""}\n${item.content.split("\n", 1)[0]}`));
     if (workRecords.length) results = workRecords;
   }
-  if (intent === "rules" && includeGlobal) {
-    // Reserve room for cross-project preferences even when a coding question
-    // contains no words such as "commit". These remain historical evidence.
-    const preferences = results.filter((item) => item.type === "persona" && isGlobalSource(item.source_path ?? ""))
-      .sort((a, b) => b.priority - a.priority || b.score - a.score).slice(0, 2);
-    const ids = new Set(preferences.map((item) => item.id));
-    results = [...preferences.map((item, index) => ({ ...item, score: 2 - index * 0.01 })), ...results.filter((item) => !ids.has(item.id))];
-  }
+  if (intent === "rules") results = applicableGuidance(results, query);
   const planned = applyRetrievalPlan(results, {
     limit,
     query,

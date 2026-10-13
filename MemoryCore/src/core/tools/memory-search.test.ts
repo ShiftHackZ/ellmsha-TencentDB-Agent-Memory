@@ -1,3 +1,4 @@
+import { scenarioMemoryId } from "../../gateway/scenario-memory-index.js";
 import { describe, expect, it } from "vitest";
 import { applyRetrievalPlan, executeMemorySearch, formatSearchResponse, paginateSourceCatalog, type MemorySearchResultItem } from "./memory-search.js";
 
@@ -216,25 +217,40 @@ describe("applyRetrievalPlan", () => {
   });
 });
 
-
 describe("scope-first execution", () => {
   function row(id: string, path: string, content: string, type = "episodic", priority = 70) {
-    return { record_id: id, content, type, priority, scene_name: "fixture", version: 1,
-      timestamp_start: "2026-10-11", timestamp_end: "2026-10-11", team_id: "team", user_id: "user", agent_id: "agent", task_id: "",
-      metadata_json: JSON.stringify({ source_path: path }), score: 0.5 };
+    return {
+      record_id: id,
+      content,
+      type,
+      priority,
+      scene_name: "fixture",
+      version: 1,
+      timestamp_start: "2026-10-11",
+      timestamp_end: "2026-10-11",
+      team_id: "team",
+      user_id: "user",
+      agent_id: "agent",
+      task_id: "",
+      metadata_json: JSON.stringify({ source_path: path }),
+      score: 0.5,
+    };
   }
   function store(rows: ReturnType<typeof row>[], recalled = rows) {
-    return { isDegraded: () => false, isFtsAvailable: () => true, getCapabilities: () => ({ nativeHybridSearch: false }),
+    return {
+      isDegraded: () => false,
+      isFtsAvailable: () => true,
+      getCapabilities: () => ({ nativeHybridSearch: false }),
       searchL1Fts: () => recalled,
       queryL1Paginated: (filter: any) => {
-        expect(filter).toMatchObject({ teamId: "team", userId: "user", agentId: "agent", offset: 0, limit: 4096 });
+        expect(filter).toMatchObject({ teamId: "team", userId: "user", agentId: "agent", offset: 0 });
+        expect([2048, 4096]).toContain(filter.limit);
         const selected = rows.filter((r) => !filter.type || r.type === filter.type);
         return { rows: selected, total: selected.length };
       },
     } as never;
   }
-  const base = { query: "latest task for Example", limit: 8, scopeMode: "current_project" as const,
-    projectScopes: ["example-123"], projectAliases: ["Example"], filter: { teamId: "team", userId: "user", agentId: "agent" } };
+  const base = { query: "latest task for Example", limit: 8, scopeMode: "current_project" as const, projectScopes: ["example-123"], projectAliases: ["Example"], filter: { teamId: "team", userId: "user", agentId: "agent" } };
 
   it("finds dated work omitted by global semantic top-K without crossing project isolation", async () => {
     const old = row("old", "v2/projects/example-ab/EX-121-release.md", "Released 2026-09-28");
@@ -248,14 +264,42 @@ describe("scope-first execution", () => {
     expect(result.degraded).toBe(false);
   });
 
-  it("preserves imported global preferences and keeps them labelled evidence", async () => {
-    const preference = row("pref", "v2/wiki/workflow-preference.md", "User prefers reviewing changes before committing.", "persona", 75);
-    const project = row("rule", "knowledge/example-123/testing.md", "Test project changes.", "instruction");
-    const unrelated = row("foreign", "v2/projects/unrelated-ab/private-rule.md", "Other project rule.", "instruction", 100);
-    const result = await executeMemorySearch({ ...base, query: "fix a bug", intent: "rules", includeGlobal: true,
-      vectorStore: store([preference, project, unrelated], [unrelated]) });
-    expect(result.results.map((r) => r.id)).toEqual(["pref", "rule"]);
-    expect(result.results[0].type).toBe("persona");
+  it("retrieves active imported project rules without author metadata and excludes irrelevant global personas", async () => {
+    const imported = (id: string, path: string, content: string, type: string, priority = 75) => ({
+      ...row(id, path, content, type, priority),
+      metadata_json: JSON.stringify({ migration: { source: "ellmsha-v2-vault", source_path: path, status: "active", source_sha256: "a".repeat(64) } }),
+    });
+    const project = imported("rule", "projects/example-ab/testing.md", "Use the staging receiver for validation.", "instruction");
+    const globalRule = imported("global-rule", "wiki/git-rule.md", "Never commit without explicit authorization.", "instruction", 90);
+    const preference = imported("car", "wiki/car.md", "My automobile is green.", "persona");
+    const alias = imported("alias", "wiki/other-project-alias.md", "OtherProduct aliases are APP and Product.", "persona");
+    const unrelated = imported("foreign", "projects/unrelated-ab/private-rule.md", "Use production receiver.", "instruction", 100);
+    const result = await executeMemorySearch({ ...base, query: "fix a bug", intent: "rules", includeGlobal: true, vectorStore: store([preference, alias, project, unrelated, globalRule], [unrelated]) });
+    expect(result.results.map((r) => r.id)).toEqual(["rule", "global-rule"]);
+    expect(result.results[0]).toMatchObject({ guidance_status: "active", guidance_scope: "project", source_origin: "v2_import", source_sha256: "a".repeat(64) });
+    expect(result.complete).toBe(true);
+    const topical = await executeMemorySearch({ ...base, query: "automobile", intent: "rules", includeGlobal: true, vectorStore: store([preference, project]) });
+    expect(topical.results.map((r) => r.id)).toContain("car");
+  });
+
+  it("recovers legacy explicit rule lifecycle from writer identity and paginates every rule", async () => {
+    const explicit = (path: string, content: string) => ({
+      ...row(scenarioMemoryId(path, { teamId: "team", userId: "user", agentId: "agent" }), path, content, "instruction", 70),
+      session_key: "ellmsha-durable-memory",
+    });
+    const projectRules = Array.from({ length: 6 }, (_, index) => explicit(`knowledge/example-123/rule-${index}.md`, `Use fixture receiver ${index}.`));
+    const globalRule = explicit("knowledge/global/commit.md", "Never commit without approval.");
+    const records = [...projectRules, globalRule];
+    const first = await executeMemorySearch({ ...base, query: "unrelated task words", limit: 4, intent: "rules", includeGlobal: true, vectorStore: store(records, []) });
+    expect(first.results).toHaveLength(4);
+    expect(first.results.every((r) => r.guidance_scope === "project" && r.guidance_status === "active" && r.source_origin === "scenario_write")).toBe(true);
+    expect(first).toMatchObject({ complete: false, nextOffset: 4 });
+    const second = await executeMemorySearch({ ...base, query: "unrelated task words", limit: 4, offset: first.nextOffset, intent: "rules", includeGlobal: true, vectorStore: store(records, []) });
+    expect(second.complete).toBe(true);
+    expect(new Set([...first.results, ...second.results].map((r) => r.id))).toEqual(new Set(records.map((r) => r.record_id)));
+    const historical = { ...globalRule, record_id: "historical-hit" };
+    const unverified = await executeMemorySearch({ ...base, query: "unrelated", intent: "rules", includeGlobal: true, vectorStore: store([historical], []) });
+    expect(unverified.results).toEqual([]);
   });
 
   it("does not replace a topical unknown-status decision with an unrelated accepted document", async () => {
@@ -263,6 +307,60 @@ describe("scope-first execution", () => {
     const generic = row("generic", "knowledge/example-123/release.md", "Accepted release and implementation on 2026-10-11.", "instruction");
     const result = await executeMemorySearch({ ...base, query: "Which licensing decision?", intent: "current_decision", vectorStore: store([actual, generic], [actual, generic]) });
     expect(result.results[0].id).toBe("actual");
+  });
+
+  it("keeps the relevant rule on a bounded page despite long instructions and an unknown issue", async () => {
+    const active = (id: string, subject: string, content: string) => ({
+      ...row(id, `knowledge/example-123/${subject}.md`, content, "instruction"),
+      metadata_json: JSON.stringify({ source_path: `knowledge/example-123/${subject}.md`, source_status: "active", source_origin: "scenario_write" }),
+    });
+    const rule = active("date-rule", "release-version-date", "# Release version date\nBuild versions use the publication calendar date, including when packaging crosses midnight.");
+    const noise = Array.from({ length: 36 }, (_, index) =>
+      active(
+        `noise-${index}`,
+        `operations-${index}`,
+        `# Operations backlog ${index}\n` +
+          "Prepare work and inspect project files, memory, source, tools, rules, code and settings. The independent QA checks current code against latest main, describes exact evidence and writes a short visible answer for every synthetic task. Include releases in the work inventory. ".repeat(
+            20
+          )
+      )
+    );
+    const queries = [
+      "Do not call tools, inspect files, change code or settings, write memory, or access another project. Review https://fixture.atlassian.net/browse/EX-999999 against latest main. What rule governs choosing the release version date?",
+      "Prepare the next release for EX-999999 against latest main. Follow applicable project rules.",
+      "Prepare the next production release for EX-999999. Which project rules apply?",
+      "Recent user goal: Prepare the next release for EX-999999. Continuation: Test this against latest main.",
+    ];
+    for (const query of queries) {
+      const vectorStore = store([...noise, rule], noise.slice(0, 8));
+      const facts = await executeMemorySearch({ ...base, query, intent: "exact_ids", exactIds: ["EX-999999"], vectorStore });
+      expect(facts.results).toEqual([]);
+      expect(facts.missingExactIds).toEqual(["EX-999999"]);
+      const guidance = await executeMemorySearch({ ...base, query, intent: "rules", limit: 4, exactIds: [], vectorStore });
+      expect(
+        guidance.results.map((r) => r.id),
+        query
+      ).toContain(rule.record_id);
+      expect(guidance).toMatchObject({ total: 37, complete: false, nextOffset: 4 });
+      expect(guidance.results.find((r) => r.id === rule.record_id)).toMatchObject({ guidance_status: "active", guidance_scope: "project" });
+    }
+  });
+
+  it("retains cross-language semantic rule matches over incidental lexical instruction matches", async () => {
+    const active = (id: string, content: string) => ({
+      ...row(id, `knowledge/example-123/${id}.md`, content, "instruction"),
+      metadata_json: JSON.stringify({ source_path: `knowledge/example-123/${id}.md`, source_status: "active", source_origin: "scenario_write" }),
+    });
+    const relevant = active("publication-calendar", "Release identifiers follow the publication calendar date.");
+    const distractors = Array.from({ length: 8 }, (_, i) => active(`other-${i}`, `Подготовь следующую справку ${i}. Проверь релизную памятку и сборку метрик. Составь новую версию внутренней инструкции.`));
+    for (const query of ["Подготовь следующую релизную сборку", "собери новую версию"]) {
+      const result = await executeMemorySearch({ ...base, query, intent: "rules", limit: 4, vectorStore: store([...distractors, relevant], [relevant, ...distractors]) });
+      expect(
+        result.results.map((r) => r.id),
+        query
+      ).toContain(relevant.record_id);
+      expect(result).toMatchObject({ total: 9, complete: false, nextOffset: 4 });
+    }
   });
 
   it("proves an exact negative only against the bounded source census", async () => {
@@ -286,7 +384,12 @@ describe("scope-first execution", () => {
 
   it("reports a failed semantic branch even when a keyword census finds fallback evidence", async () => {
     const actual = row("actual", "knowledge/example-123/topic.md", "database topic evidence");
-    const adapter = { ...(store([actual]) as any), searchL1Fts: () => { throw new Error("fixture failure"); } };
+    const adapter = {
+      ...(store([actual]) as any),
+      searchL1Fts: () => {
+        throw new Error("fixture failure");
+      },
+    };
     const result = await executeMemorySearch({ ...base, query: "database", vectorStore: adapter });
     expect(result.results[0].id).toBe("actual");
     expect(result.degraded).toBe(true);
@@ -302,22 +405,27 @@ describe("scope-first execution", () => {
   });
 });
 
-
 describe("retrieval regressions", () => {
   it("does not treat body-level supersession as a superseded note", () => {
-    const result = applyRetrievalPlan([
-      item({ id: "new", content: "Implementation and validation\nOn 2026-10-08 a failed state is superseded by the next state.", source_path: "v2/projects/example/EX-122.md", source_status: "active" }),
-      item({ id: "old", content: "Implemented 2026-10-07", source_path: "v2/projects/example/EX-121.md" }),
-    ], { intent: "latest", limit: 8 });
+    const result = applyRetrievalPlan(
+      [
+        item({ id: "new", content: "Implementation and validation\nOn 2026-10-08 a failed state is superseded by the next state.", source_path: "v2/projects/example/EX-122.md", source_status: "active" }),
+        item({ id: "old", content: "Implemented 2026-10-07", source_path: "v2/projects/example/EX-121.md" }),
+      ],
+      { intent: "latest", limit: 8 }
+    );
     expect(result.results[0]).toMatchObject({ id: "new", status_hint: "unknown" });
   });
 
   it("does not match an unrelated nested alias or a different explicit version", () => {
-    const result = applyRetrievalPlan([
-      item({ id: "same", content: "same", source_path: "v2/projects/example-abc123/rule.md" }),
-      item({ id: "nested", content: "nested", source_path: "v2/projects/isolated-example-v2-abc123/rule.md" }),
-      item({ id: "version", content: "version", source_path: "v2/projects/example-v2-abc123/rule.md" }),
-    ], { limit: 8, scopeMode: "current_project", projectAliases: ["example_v3"] });
+    const result = applyRetrievalPlan(
+      [
+        item({ id: "same", content: "same", source_path: "v2/projects/example-abc123/rule.md" }),
+        item({ id: "nested", content: "nested", source_path: "v2/projects/isolated-example-v2-abc123/rule.md" }),
+        item({ id: "version", content: "version", source_path: "v2/projects/example-v2-abc123/rule.md" }),
+      ],
+      { limit: 8, scopeMode: "current_project", projectAliases: ["example_v3"] }
+    );
     expect(result.results.map((item) => item.id)).toEqual(["same"]);
   });
 

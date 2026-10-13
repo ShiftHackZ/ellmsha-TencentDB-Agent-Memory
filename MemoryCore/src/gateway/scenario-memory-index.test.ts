@@ -15,11 +15,34 @@ describe("searchable scenario writes", () => {
     const embedding = { embed: vi.fn().mockResolvedValue(vector) } as unknown as EmbeddingService;
     expect(await indexScenarioMemory({ store, embedding, isolation, path, content: "Updated requirements" })).toBe(id);
     expect(queryL1Records).toHaveBeenCalledWith({ ...isolation, recordIds: [id] });
-    expect(upsertL1).toHaveBeenCalledWith(expect.objectContaining({
-      id, content: "Updated requirements", version: 5, createdAt: "2026-01-01",
-      metadata: { source_path: path }, ...isolation,
-    }), vector);
+    expect(upsertL1).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id,
+        content: "Updated requirements",
+        version: 5,
+        createdAt: "2026-01-01",
+        metadata: { source_path: path, source_origin: "scenario_write" },
+        ...isolation,
+      }),
+      vector
+    );
     expect(scenarioMemoryId(path, { ...isolation, teamId: "other" })).not.toBe(id);
+  });
+
+  it("marks explicitly stored instructions active without inventing a user author", async () => {
+    const upsertL1 = vi.fn().mockResolvedValue(true);
+    const store = { queryL1Records: vi.fn().mockResolvedValue([]), upsertL1 } as unknown as IMemoryStore;
+    await indexScenarioMemory({ store, path: "knowledge/fixture/rule.md", content: "Use local fixtures.", type: "instruction" });
+    expect(upsertL1).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metadata: {
+          source_path: "knowledge/fixture/rule.md",
+          source_origin: "scenario_write",
+          source_status: "active",
+        },
+      }),
+      undefined
+    );
   });
 
   it("does not report success when the store rejects the searchable record", async () => {
