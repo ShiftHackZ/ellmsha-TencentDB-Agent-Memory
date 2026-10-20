@@ -257,3 +257,24 @@ npm run seed-v2
 ## License
 
 MIT
+
+
+### Required project guidance inventory
+
+The authenticated `POST /v3/atomic/search` request accepts `guidance_inventory`
+(boolean, default `false`). With `intent: "rules"`, it enumerates active guidance
+from the isolated instruction/persona census instead of semantic retrieval.
+For v2-imported instructions, the importer's priority-90 guidance/rule/procedure
+classification is required; historical decisions/caveats stay available through
+ordinary search. Active preferences/personas and explicit v3 instructions remain
+eligible regardless of semantic query relevance. Existing
+scope, identity isolation, `include_global`, `limit` and `offset` still apply.
+Ordinary searches retain their existing semantic behavior.
+
+Responses acknowledge `guidance_inventory` and report `guidance_locality` as
+`local` only for a SQLite inventory with local file sources and no embedding call;
+otherwise locality is `unverified`. The existing `degraded`, `complete`, `returned`,
+`total_candidates` and `next_offset` fields describe coverage. A reached census
+bound is incomplete coverage, never a successful empty inventory. Clients must
+reject unacknowledged inventories, incomplete/unstable pagination and unreadable
+full sources rather than starting a task with partial rules.

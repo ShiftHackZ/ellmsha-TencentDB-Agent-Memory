@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { reportRecallMetrics } from "../core/report/metric-tracking-recall.js";
 import { StorageAdapter } from "../core/storage/adapter.js";
 
 const executeMemorySearch = vi.hoisted(() => vi.fn());
@@ -93,6 +94,17 @@ describe("atomic/search gateway compatibility", () => {
       matched_exact_ids: ["DEMO-4510"],
       missing_exact_ids: [],
     });
+  });
+
+  it("acknowledges and forwards mandatory inventory without changing ordinary search defaults", async () => {
+    executeMemorySearch.mockResolvedValue(searchResult());
+    const response = await handleAtomicSearch({ query: "required rules", intent: "rules", guidance_inventory: true }, auth, "mandatory", dependencies());
+    expect(response.data).toMatchObject({ guidance_inventory: true, guidance_locality: "unverified" });
+    expect(reportRecallMetrics).not.toHaveBeenCalled();
+    expect(executeMemorySearch).toHaveBeenCalledWith(expect.objectContaining({ guidanceInventory: true, intent: "rules" }));
+    const ordinary = await handleAtomicSearch({ query: "ordinary" }, auth, "ordinary", dependencies());
+    expect(ordinary.data).toMatchObject({ guidance_inventory: false });
+    expect(reportRecallMetrics).toHaveBeenCalledTimes(1);
   });
 
   it("preserves active rule storage provenance in the public response", async () => {

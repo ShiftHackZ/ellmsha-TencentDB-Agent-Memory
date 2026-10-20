@@ -264,6 +264,56 @@ describe("scope-first execution", () => {
     expect(result.degraded).toBe(false);
   });
 
+  it("enumerates mandatory active guidance without calling embeddings or FTS", async () => {
+    const rule = (id: string, path: string) => ({
+      ...row(id, path, "Apply required project policy.", "instruction", 90),
+      metadata_json: JSON.stringify({ source_path: path, source_origin: "scenario_write", source_status: "active" }),
+    });
+    const rows = Array.from({ length: 19 }, (_, i) => rule(`rule-${i}`, `knowledge/example-123/rule-${i}.md`));
+    rows.push(rule("foreign", "knowledge/other-456/rule.md"));
+    rows.push({
+      ...row("old-review", "unused", "Historical review finding, not a rule.", "instruction", 75),
+      metadata_json: JSON.stringify({ migration: { source: "ellmsha-v2-vault", source_path: "projects/example-ab/review.md", status: "active" } }),
+    });
+    rows.push({
+      ...row("global-preference", "unused", "Do not commit without a request.", "persona", 75),
+      metadata_json: JSON.stringify({ migration: { source: "ellmsha-v2-vault", source_path: "wiki/user-commit-preference.md", status: "active" } }),
+    });
+    const db = {
+      ...(store(rows) as any),
+      searchL1Fts: () => {
+        throw new Error("FTS must not run");
+      },
+    };
+    const embedding = {
+      embed: () => {
+        throw new Error("Ollama unavailable");
+      },
+    } as never;
+    const ids: string[] = [];
+    for (const offset of [0, 16]) {
+      const result = await executeMemorySearch({
+        ...base,
+        query: "active project rules and applicable global guidance",
+        intent: "rules",
+        guidanceInventory: true,
+        includeGlobal: true,
+        vectorStore: db,
+        embeddingService: embedding,
+        limit: 16,
+        offset,
+      });
+      expect(result.degraded).toBe(false);
+      expect(result.total).toBe(20);
+      expect(result.complete).toBe(offset === 16);
+      ids.push(...result.results.map((r) => r.id));
+    }
+    expect(new Set(ids).size).toBe(20);
+    expect(ids).not.toContain("foreign");
+    expect(ids).not.toContain("old-review");
+    expect(ids).toContain("global-preference");
+  });
+
   it("retrieves active imported project rules without author metadata and excludes irrelevant global personas", async () => {
     const imported = (id: string, path: string, content: string, type: string, priority = 75) => ({
       ...row(id, path, content, type, priority),

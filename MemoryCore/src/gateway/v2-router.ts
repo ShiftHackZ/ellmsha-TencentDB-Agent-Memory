@@ -1209,9 +1209,7 @@ async function handleAtomicCount(body: unknown, _auth: V2AuthContext, requestId:
 async function handleAtomicSearch(body: unknown, auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
   const parsed = atomicSearchRequestSchema.safeParse(body);
   if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
-  const {
-    query, type, offset, intent, scope_mode, project_scopes, project_aliases, include_global, exact_ids,
-  } = parsed.data;
+  const { query, type, offset, intent, scope_mode, project_scopes, project_aliases, include_global, exact_ids, guidance_inventory } = parsed.data;
   const limit = parsed.data.limit ?? 5;
 
   const tStart = performance.now();
@@ -1219,20 +1217,27 @@ async function handleAtomicSearch(body: unknown, auth: V2AuthContext, requestId:
   // **不带 sessionId**，否则会把其它 session 写入的 L1 记忆过滤掉，导致
   // 新会话里召不回历史记忆（与 conversation/search 的处理保持一致）。
   const iso = deps.requestIsolation;
-  const searchFilter = iso ? {
-    ...(iso.teamId ? { teamId: iso.teamId } : {}),
-    ...(iso.userId ? { userId: iso.userId } : {}),
-    ...(iso.agentId ? { agentId: iso.agentId } : {}),
-    ...(iso.taskId ? { taskId: iso.taskId } : {}),
-    // 不传 sessionId：L1 召回应跨 session（agent 维度）
-  } : undefined;
+  const searchFilter = iso
+    ? {
+        ...(iso.teamId ? { teamId: iso.teamId } : {}),
+        ...(iso.userId ? { userId: iso.userId } : {}),
+        ...(iso.agentId ? { agentId: iso.agentId } : {}),
+        ...(iso.taskId ? { taskId: iso.taskId } : {}),
+        // 不传 sessionId：L1 召回应跨 session（agent 维度）
+      }
+    : undefined;
   const result = await executeMemorySearch({
-    query, limit, type, offset, intent,
+    query,
+    limit,
+    type,
+    offset,
+    intent,
     scopeMode: scope_mode,
     projectScopes: project_scopes,
     projectAliases: project_aliases,
     includeGlobal: include_global,
     exactIds: exact_ids,
+    guidanceInventory: guidance_inventory,
     filter: searchFilter,
     vectorStore: deps.getStore(),
     embeddingService: deps.getEmbedding(),
@@ -1240,56 +1245,61 @@ async function handleAtomicSearch(body: unknown, auth: V2AuthContext, requestId:
   });
   const recallLatencyMs = performance.now() - tStart;
 
-  // 非侵入式上报召回指标（service 模式，静默失败，绝不影响业务返回）
-  try {
-    reportRecallMetrics({
-      instanceId: auth.serviceId,
-      recalledL1Memories: result.results.map((r) => ({ content: r.content, score: r.score, type: r.type })),
-      recallStrategy: result.strategy === "fts" ? "keyword" : result.strategy === "none" ? "skipped" : result.strategy,
-      recallLatencyMs,
-      hasError: false,
-    });
-  } catch {
-    // 静默失败
-  }
-
-  // 非侵入式在当前 Span 上记录 recall query 和 results，供在线评测系统消费
-  try {
-    const { getObservabilityBackend } = await import("../core/report/factory.js");
-    const ctx = getObservabilityBackend().tracePropagation.serializeTraceContext();
-    if (ctx && (ctx as any)._traceId) {
-      // 通过 OTel API 在当前 span 上添加属性
-      try {
-        const otelApi = await import("@opentelemetry/api");
-        const activeSpan = otelApi.trace.getSpan(otelApi.context.active());
-        if (activeSpan) {
-          activeSpan.setAttribute("tdai.recall.query", query);
-          activeSpan.setAttribute("tdai.recall.hitCount", result.results.length);
-          activeSpan.setAttribute("tdai.recall.strategy", result.strategy || "unknown");
-          if (result.results.length > 0) {
-            activeSpan.setAttribute("tdai.recall.topScore", Math.max(...result.results.map(r => r.score)));
-            // 限制 results 属性长度（OTel 属性不宜过长），最多前 5 条
-            const truncatedResults = result.results.slice(0, 5).map(r => ({
-              content: r.content.substring(0, 200),
-              score: r.score,
-              type: r.type,
-            }));
-            activeSpan.setAttribute("tdai.recall.results", JSON.stringify(truncatedResults));
-          } else {
-            activeSpan.setAttribute("tdai.recall.results", "[]");
-          }
-          activeSpan.setAttribute("tdai.recall.level", type === "l0" ? "l0" : "l1");
-        }
-      } catch {
-        // OTel API 不可用时静默降级
-      }
+  // Mandatory guidance is not an observability payload (including local-only routing).
+  if (!guidance_inventory) {
+    // 非侵入式上报召回指标（service 模式，静默失败，绝不影响业务返回）
+    try {
+      reportRecallMetrics({
+        instanceId: auth.serviceId,
+        recalledL1Memories: result.results.map((r) => ({ content: r.content, score: r.score, type: r.type })),
+        recallStrategy: result.strategy === "fts" ? "keyword" : result.strategy === "none" ? "skipped" : result.strategy,
+        recallLatencyMs,
+        hasError: false,
+      });
+    } catch {
+      // 静默失败
     }
-  } catch {
-    // 静默失败
+
+    // 非侵入式在当前 Span 上记录 recall query 和 results，供在线评测系统消费
+    try {
+      const { getObservabilityBackend } = await import("../core/report/factory.js");
+      const ctx = getObservabilityBackend().tracePropagation.serializeTraceContext();
+      if (ctx && (ctx as any)._traceId) {
+        // 通过 OTel API 在当前 span 上添加属性
+        try {
+          const otelApi = await import("@opentelemetry/api");
+          const activeSpan = otelApi.trace.getSpan(otelApi.context.active());
+          if (activeSpan) {
+            activeSpan.setAttribute("tdai.recall.query", query);
+            activeSpan.setAttribute("tdai.recall.hitCount", result.results.length);
+            activeSpan.setAttribute("tdai.recall.strategy", result.strategy || "unknown");
+            if (result.results.length > 0) {
+              activeSpan.setAttribute("tdai.recall.topScore", Math.max(...result.results.map((r) => r.score)));
+              // 限制 results 属性长度（OTel 属性不宜过长），最多前 5 条
+              const truncatedResults = result.results.slice(0, 5).map((r) => ({
+                content: r.content.substring(0, 200),
+                score: r.score,
+                type: r.type,
+              }));
+              activeSpan.setAttribute("tdai.recall.results", JSON.stringify(truncatedResults));
+            } else {
+              activeSpan.setAttribute("tdai.recall.results", "[]");
+            }
+            activeSpan.setAttribute("tdai.recall.level", type === "l0" ? "l0" : "l1");
+          }
+        } catch {
+          // OTel API 不可用时静默降级
+        }
+      }
+    } catch {
+      // 静默失败
+    }
   }
 
   const items: AtomicSearchHit[] = result.results.map((r) => ({
-    id: r.id, type: r.type, content: r.content,
+    id: r.id,
+    type: r.type,
+    content: r.content,
     source_path: r.source_path,
     background: r.scene_name || undefined,
     version: r.version ?? 0,
@@ -1297,7 +1307,9 @@ async function handleAtomicSearch(body: unknown, auth: V2AuthContext, requestId:
     user_id: r.user_id,
     agent_id: r.agent_id,
     task_id: r.task_id,
-    created_at: r.created_at, updated_at: r.updated_at, score: r.score,
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+    score: r.score,
     event_date: r.event_date,
     status_hint: r.status_hint,
     source_status: r.source_status,
@@ -1314,11 +1326,7 @@ async function handleAtomicSearch(body: unknown, auth: V2AuthContext, requestId:
       if (!baseStorage) throw new Error("storage_unavailable");
       const storage = scopedProfileStorage(baseStorage, deps.requestIsolation);
       const catalog = await listBoundedScenarioObjects(storage.getBackend(), StoragePaths.sceneBlocksDir);
-      const paths = catalog.entries
-        .filter((entry) => !entry.isDirectory)
-        .map((entry) => entry.key.startsWith(StoragePaths.sceneBlocksDir)
-          ? entry.key.slice(StoragePaths.sceneBlocksDir.length)
-          : entry.key);
+      const paths = catalog.entries.filter((entry) => !entry.isDirectory).map((entry) => (entry.key.startsWith(StoragePaths.sceneBlocksDir) ? entry.key.slice(StoragePaths.sceneBlocksDir.length) : entry.key));
       sourceCatalog = paginateSourceCatalog(paths, {
         limit,
         offset,
@@ -1338,25 +1346,30 @@ async function handleAtomicSearch(body: unknown, auth: V2AuthContext, requestId:
   // Semantic and alphabetical catalogue pages have different orderings. Do
   // not compare their current pages as if they were the same cursor. The L2
   // catalogue also includes intentionally historical/unindexed originals.
-  const representedPaths = new Set(result.indexedSourcePaths ?? items.flatMap((item) => item.source_path ? [item.source_path] : []));
+  const representedPaths = new Set(result.indexedSourcePaths ?? items.flatMap((item) => (item.source_path ? [item.source_path] : [])));
   if (sourceCatalog) sourceCatalog.unindexed_paths = sourceCatalog.paths.filter((path) => !representedPaths.has(path));
   const complete = result.complete && (sourceCatalog?.complete ?? true);
   const degraded = !!result.degraded || !!sourceCatalog?.error;
 
-  return successEnvelope<AtomicSearchData>({
-    strategy: result.strategy,
-    degraded,
-    message: sourceCatalog?.error ? `Source catalogue incomplete: ${sourceCatalog.error}. ${result.message ?? ""}`.trim() : result.message,
-    evidence_status: degraded ? "degraded" : result.missingExactIds.length ? "missing_exact_ids" : !complete ? "partial" : items.length ? "available" : "empty",
-    items,
-    returned: items.length,
-    total_candidates: sourceCatalog?.total ?? result.total,
-    complete,
-    next_offset: sourceCatalog?.next_offset ?? result.nextOffset,
-    matched_exact_ids: result.matchedExactIds,
-    missing_exact_ids: result.missingExactIds,
-    source_catalog: sourceCatalog,
-  }, requestId);
+  return successEnvelope<AtomicSearchData>(
+    {
+      guidance_inventory: guidance_inventory && intent === "rules",
+      guidance_locality: guidance_inventory && intent === "rules" && deps.getStore()?.getCapabilities?.().localStorageOnly === true && deps.getStorage()?.getBackend().type === "local" ? "local" : "unverified",
+      strategy: result.strategy,
+      degraded,
+      message: sourceCatalog?.error ? `Source catalogue incomplete: ${sourceCatalog.error}. ${result.message ?? ""}`.trim() : result.message,
+      evidence_status: degraded ? "degraded" : result.missingExactIds.length ? "missing_exact_ids" : !complete ? "partial" : items.length ? "available" : "empty",
+      items,
+      returned: items.length,
+      total_candidates: sourceCatalog?.total ?? result.total,
+      complete,
+      next_offset: sourceCatalog?.next_offset ?? result.nextOffset,
+      matched_exact_ids: result.matchedExactIds,
+      missing_exact_ids: result.missingExactIds,
+      source_catalog: sourceCatalog,
+    },
+    requestId,
+  );
 }
 
 async function handleAtomicDelete(body: unknown, auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {

@@ -248,6 +248,8 @@ export interface StoreInitResult {
  * Callers use this to select search strategies and degrade gracefully.
  */
 export interface StoreCapabilities {
+  /** Inventory reads use only an in-process local store, with no network backend calls. */
+  localStorageOnly?: boolean;
   /** Whether vector (embedding) search is available. */
   vectorSearch: boolean;
   /** Whether FTS (full-text keyword) search is available. */

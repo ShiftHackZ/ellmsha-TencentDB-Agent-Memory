@@ -173,6 +173,8 @@ export const atomicSearchRequestSchema = z.object({
   project_scopes: z.array(z.string().min(3).max(160)).max(64).default([]),
   project_aliases: z.array(z.string().min(2).max(160)).max(64).default([]),
   include_global: z.boolean().default(false),
+  /** For intent=rules: enumerate all active scoped guidance without embeddings. */
+  guidance_inventory: z.boolean().default(false).describe("For intent=rules, enumerate complete active scoped guidance without embeddings or semantic top-K. False preserves ordinary search behavior."),
   exact_ids: z.array(z.string().min(2).max(64)).max(32).default([]),
   team_id: z.string().optional(),
   user_id: z.string().optional(),
@@ -202,6 +204,10 @@ export type AtomicSearchHit = AtomicDetail & {
 };
 
 export interface AtomicSearchData {
+  /** Acknowledges deterministic active-guidance enumeration, with no embedding calls. */
+  guidance_inventory?: boolean;
+  /** Local only when inventory is SQLite, sources are local files, and no semantic search ran. */
+  guidance_locality?: "local" | "unverified";
   /** Retrieval path actually used; census coverage is independent of match count. */
   strategy: string;
   /** True if a backend/candidate bound prevents exhaustive evidence. */

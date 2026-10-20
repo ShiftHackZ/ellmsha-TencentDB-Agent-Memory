@@ -407,7 +407,7 @@ const GUIDANCE_GENERIC_TOKENS = new Set([
   "проект",
   "задача",
 ]);
-function applicableGuidance(items: MemorySearchResultItem[], query: string): MemorySearchResultItem[] {
+function applicableGuidance(items: MemorySearchResultItem[], query: string, inventory = false): MemorySearchResultItem[] {
   const tokens = new Set(extractQueryTokens(query.replace(/^applicable stable rules and decisions for:\s*/i, "")).filter((token) => !GUIDANCE_GENERIC_TOKENS.has(token)));
   const relevant = (item: MemorySearchResultItem) => extractQueryTokens(item.content).some((token) => tokens.has(token));
   return items.flatMap((item) => {
@@ -418,8 +418,16 @@ function applicableGuidance(items: MemorySearchResultItem[], query: string): Mem
     // Canonical global rules (the importer assigns priority 90 to rules/guidance)
     // apply across tasks. Personal facts and project-alias notes need relevance.
     const globalRule = global && active && item.type === "instruction" && (item.source_origin === "scenario_write" || item.priority >= 90);
-    if (global && !globalRule && !relevant(item)) return [];
-    if (!global && !active && item.score <= 0) return [];
+    if (inventory) {
+      if (!active) return [];
+      // The v2 importer reserves priority 90 for explicit guidance/rule/procedure
+      // tags. Imported decisions and caveats are historical evidence, not rules.
+      // Preserve personas/preferences and all explicit v3 instruction writes.
+      if (item.source_origin === "v2_import" && item.type === "instruction" && item.priority < 90) return [];
+    } else {
+      if (global && !globalRule && !relevant(item)) return [];
+      if (!global && !active && item.score <= 0) return [];
+    }
     return [
       {
         ...item,
@@ -452,6 +460,8 @@ export async function executeMemorySearch(params: {
   projectAliases?: string[];
   includeGlobal?: boolean;
   exactIds?: string[];
+  /** Complete active guidance inventory, independent of semantic recall. */
+  guidanceInventory?: boolean;
 }): Promise<MemorySearchResult> {
   const {
     query,
@@ -469,13 +479,14 @@ export async function executeMemorySearch(params: {
     projectAliases = [],
     includeGlobal = false,
     exactIds = [],
+    guidanceInventory = false,
   } = params;
 
   logger?.debug?.(
     `${TAG} CALLED: query="${query.slice(0, 100)}", limit=${limit}, ` +
       `typeFilter=${typeFilter ?? "(none)"}, sceneFilter=${sceneFilter ?? "(none)"}, ` +
       `vectorStore=${vectorStore ? "available" : "UNAVAILABLE"}, ` +
-      `embeddingService=${embeddingService ? "available" : "UNAVAILABLE"}`
+      `embeddingService=${embeddingService ? "available" : "UNAVAILABLE"}`,
   );
 
   if (!query || query.trim().length === 0) {
@@ -527,15 +538,20 @@ export async function executeMemorySearch(params: {
   }
 
   const candidateK = scopeMode === "current_project" ? 256 : Math.min(Math.max((offset + limit) * 6, 48), 256);
-  const recalled = await recallL1Candidates({
-    query,
-    topK: candidateK,
-    vectorStore,
-    embeddingService,
-    logger,
-    filter: isolationFilter,
-    logTag: TAG,
-  }).catch(() => ({ hits: [] as L1SearchResult[], strategy: "none" as const, failedPaths: ["semantic"] }));
+  // Required guidance inventories are deterministic, never an embedding top-K.
+  // An unavailable embedding model must not hide or reorder mandatory guidance.
+  const recalled: Awaited<ReturnType<typeof recallL1Candidates>> =
+    intent === "rules" && guidanceInventory
+      ? { hits: [] as L1SearchResult[], strategy: "none" as const }
+      : await recallL1Candidates({
+          query,
+          topK: candidateK,
+          vectorStore,
+          embeddingService,
+          logger,
+          filter: isolationFilter,
+          logTag: TAG,
+        }).catch(() => ({ hits: [] as L1SearchResult[], strategy: "none" as const, failedPaths: ["semantic"] }));
 
   // A semantic top-K is not a source census. Enumerate a bounded isolated
   // candidate pool BEFORE project/intent filtering, retaining semantic ranks.
@@ -595,7 +611,10 @@ export async function executeMemorySearch(params: {
     const workRecords = results.filter((item) => /\b[A-Z][A-Z0-9]{1,15}-\d{2,}\b/i.test(`${item.source_path?.split("/").at(-1) ?? ""}\n${item.content.split("\n", 1)[0]}`));
     if (workRecords.length) results = workRecords;
   }
-  if (intent === "rules") results = applicableGuidance(results, query);
+  if (intent === "rules") {
+    results = applicableGuidance(results, query, guidanceInventory);
+    if (guidanceInventory) results = results.filter((item) => item.guidance_status === "active").sort((a, b) => a.id.localeCompare(b.id));
+  }
   const planned = applyRetrievalPlan(results, {
     limit,
     query,

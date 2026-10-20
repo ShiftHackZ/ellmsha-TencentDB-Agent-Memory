@@ -3340,6 +3340,7 @@ export class VectorStore implements IMemoryStore {
   /** Query the store's search capabilities. */
   getCapabilities(): StoreCapabilities {
     return {
+      localStorageOnly: true,
       vectorSearch: this.vecTablesReady,
       ftsSearch: this.ftsAvailable,
       nativeHybridSearch: false,
